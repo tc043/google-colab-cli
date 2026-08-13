@@ -24,9 +24,9 @@ from rich.console import Console
 from typing import List, Optional
 from typing_extensions import Annotated
 
+from colab_cli.console import ConsoleConnectionError, connect_console
 from colab_cli.runtime import ColabRuntime
 from colab_cli.utils import handle_image, is_runtime_proxy_error, render_display_data
-from colab_cli.console import connect_console
 
 _console = Console()
 
@@ -386,7 +386,18 @@ def console(
     state.history.log_event(s.name, "console_started", {})
     state.store.update_fields(name, s.endpoint, running="console")
     try:
-        state.run_with_runtime_proxy_retry(name, connect_console)
+        state.run_with_runtime_proxy_retry(
+            name,
+            lambda current: connect_console(
+                current,
+                refresh_session=lambda expected: state.refresh_session(
+                    name, expected_session=expected
+                ),
+            ),
+        )
+    except ConsoleConnectionError as e:
+        typer.echo(f"[colab] Console disconnected: {e}", err=True)
+        raise typer.Exit(1) from e
     except Exception as e:
         _raise_runtime_connection_error(state, name, e)
     finally:
