@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 import uuid
 
 from colab_cli.state import SessionState
-from colab_cli.utils import no_window_kwargs
+from colab_cli.utils import RuntimeProxyError, no_window_kwargs
 import typer
 from typing_extensions import Annotated
 import websocket
@@ -95,9 +95,7 @@ def _pubkey_from_identity(identity: str) -> str:
         raise typer.Exit(code=2)
     pubkey = res.stdout.strip()
     if not pubkey:
-        typer.echo(
-            f"[colab] ssh-keygen produced no key for {identity}.", err=True
-        )
+        typer.echo(f"[colab] ssh-keygen produced no key for {identity}.", err=True)
         raise typer.Exit(code=2)
     return pubkey
 
@@ -321,6 +319,8 @@ def _connect_websocket(url: str, pubkey: str) -> websocket.WebSocket:
         body = getattr(e, "resp_body", b"") or b""
         if isinstance(body, str):
             body = body.encode("utf-8", errors="replace")
+        if status == 401:
+            raise RuntimeProxyError(status, body) from e
         msg = _explain_handshake_failure(status, body)
         typer.echo(f"[colab] {msg}", err=True)
         raise typer.Exit(code=1)
@@ -485,9 +485,7 @@ def _select_proxy_session(
     """
     if session and not _session_exists(session):
         with contextlib.redirect_stdout(sys.stderr):
-            return _auto_create_session(
-                gpu, tpu, name=session, high_mem=high_mem
-            ), True
+            return _auto_create_session(gpu, tpu, name=session, high_mem=high_mem), True
     return _resolve_session(session), False
 
 
@@ -549,16 +547,19 @@ def _install_rm_signal_handlers(do_rm: Callable[[], None]) -> None:
         do_rm()
         os._exit(0)
 
-    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+    signals = [signal.SIGTERM, signal.SIGINT]
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is not None:
+        signals.insert(0, sighup)
+
+    for sig in signals:
         try:
             signal.signal(sig, _on_signal)
         except (ValueError, OSError):
             pass  # e.g. not running in the main thread
 
 
-def _run_proxy_bridge(
-    s: SessionState, identity: Optional[str], rm: bool
-) -> int:
+def _run_proxy_bridge(s: SessionState, identity: Optional[str], rm: bool) -> int:
     """Runs the ``--proxy-mode`` WebSocket-stdio bridge, honoring ``--rm``.
 
     Args:
@@ -585,7 +586,18 @@ def _run_proxy_bridge(
         _install_rm_signal_handlers(_do_rm)
 
     pubkey = _resolve_pubkey(identity)
-    ws = _connect_websocket(_build_ws_url(s), pubkey)
+    from colab_cli.common import state
+
+    try:
+        ws = state.run_with_runtime_proxy_retry(
+            s.name,
+            lambda current: _connect_websocket(_build_ws_url(current), pubkey),
+            initial_session=s,
+        )
+    except RuntimeProxyError as error:
+        message = _explain_handshake_failure(error.status_code, error.response_body)
+        typer.echo(f"[colab] {message}", err=True)
+        raise typer.Exit(code=1) from error
     try:
         return _bridge_proxy_mode(ws)
     finally:

@@ -48,13 +48,13 @@ def ls(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    s = state.store.get(name)
-    if not s:
+    if not state.store.get(name):
         typer.echo(f"[colab] Session '{name}' not found.")
         raise typer.Exit(1)
-    contents = ContentsClient(s)
     try:
-        data = contents.list_dir(path)
+        data = state.run_with_runtime_proxy_retry(
+            name, lambda s: ContentsClient(s).list_dir(path)
+        )
         state.history.log_event(name, "file_operation", {"op": "ls", "path": path})
         if data.get("type") == "directory":
             items = data.get("content", [])
@@ -80,13 +80,11 @@ def rm(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    s = state.store.get(name)
-    if not s:
+    if not state.store.get(name):
         typer.echo(f"[colab] Session '{name}' not found.")
         raise typer.Exit(1)
-    contents = ContentsClient(s)
     try:
-        contents.rm(path)
+        state.run_with_runtime_proxy_retry(name, lambda s: ContentsClient(s).rm(path))
         state.history.log_event(name, "file_operation", {"op": "rm", "path": path})
         typer.echo(f"[colab] Deleted {path}")
     except Exception as e:
@@ -259,14 +257,12 @@ def upload(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    s = state.store.get(name)
-    if not s:
+    if not state.store.get(name):
         typer.echo(f"[colab] Session '{name}' not found.")
         raise typer.Exit(1)
     if not os.path.isfile(local_path):
         typer.echo(f"[colab] Local file '{local_path}' not found.")
         raise typer.Exit(1)
-    contents = ContentsClient(s)
     tmp_gz = None
     try:
         original_size = os.path.getsize(local_path)
@@ -286,28 +282,39 @@ def upload(
 
         transfer_size = os.path.getsize(transfer_path)
 
-        if transfer_size > TRANSFER_PART_BYTES:
-            _upload_chunked(
-                state,
-                name,
-                s,
-                contents,
-                transfer_path,
-                staging_remote,
-                remote_path,
-                expected_size=original_size,
-                display_local=local_path,
-            )
-        elif use_gz:
-            _upload_compressed(state, name, s, contents, local_path, remote_path)
-        else:
-            contents.upload(local_path, remote_path)
-            state.history.log_event(
-                name,
-                "file_operation",
-                {"op": "upload", "local": local_path, "remote": remote_path},
-            )
-            typer.echo(f"[colab] Uploaded '{local_path}' to '{remote_path}'")
+        def transfer(current_session):
+            contents = ContentsClient(current_session)
+            if transfer_size > TRANSFER_PART_BYTES:
+                _upload_chunked(
+                    state,
+                    name,
+                    current_session,
+                    contents,
+                    transfer_path,
+                    staging_remote,
+                    remote_path,
+                    expected_size=original_size,
+                    display_local=local_path,
+                )
+            elif use_gz:
+                _upload_compressed(
+                    state,
+                    name,
+                    current_session,
+                    contents,
+                    local_path,
+                    remote_path,
+                )
+            else:
+                contents.upload(local_path, remote_path)
+                state.history.log_event(
+                    name,
+                    "file_operation",
+                    {"op": "upload", "local": local_path, "remote": remote_path},
+                )
+                typer.echo(f"[colab] Uploaded '{local_path}' to '{remote_path}'")
+
+        state.run_with_runtime_proxy_retry(name, transfer)
     except Exception as e:
         typer.echo(f"[colab] Upload failed: {e}")
         raise typer.Exit(1)
@@ -411,89 +418,105 @@ def download(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    s = state.store.get(name)
-    if not s:
+    if not state.store.get(name):
         typer.echo(f"[colab] Session '{name}' not found.")
         raise typer.Exit(1)
-    contents = ContentsClient(s)
     try:
-        meta = contents.list_dir(remote_path)
-        remote_size = meta.get("size") if isinstance(meta, dict) else None
+        def transfer(current_session):
+            contents = ContentsClient(current_session)
+            meta = contents.list_dir(remote_path)
+            remote_size = meta.get("size") if isinstance(meta, dict) else None
 
-        if (
-            not no_compress
-            and remote_size is not None
-            and int(remote_size) > TRANSFER_COMPRESS_ABOVE_BYTES
-        ):
-            gz_remote = remote_path + ".gz"
-            _compress_on_vm(s, remote_path, gz_remote)
+            if (
+                not no_compress
+                and remote_size is not None
+                and int(remote_size) > TRANSFER_COMPRESS_ABOVE_BYTES
+            ):
+                gz_remote = remote_path + ".gz"
+                _compress_on_vm(current_session, remote_path, gz_remote)
 
-            fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
-            os.close(fd)
-            try:
-                gz_meta = contents.list_dir(gz_remote)
-                gz_size = gz_meta.get("size") if isinstance(gz_meta, dict) else None
-                chunked = False
-                if gz_size is not None and int(gz_size) > TRANSFER_PART_BYTES:
-                    _download_chunked(
-                        state, name, s, contents, gz_remote, tmp_gz, int(gz_size)
+                fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+                os.close(fd)
+                try:
+                    gz_meta = contents.list_dir(gz_remote)
+                    gz_size = gz_meta.get("size") if isinstance(gz_meta, dict) else None
+                    chunked = False
+                    if gz_size is not None and int(gz_size) > TRANSFER_PART_BYTES:
+                        _download_chunked(
+                            state,
+                            name,
+                            current_session,
+                            contents,
+                            gz_remote,
+                            tmp_gz,
+                            int(gz_size),
+                        )
+                        chunked = True
+                    else:
+                        contents.download(gz_remote, tmp_gz)
+
+                    with gzip.open(tmp_gz, "rb") as src, open(local_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+                    actual_size = os.path.getsize(local_path)
+                    if actual_size != int(remote_size):
+                        raise RuntimeError(
+                            f"Size mismatch after decompression: "
+                            f"expected {remote_size}, got {actual_size}"
+                        )
+
+                    contents.rm(gz_remote)
+
+                    event = {
+                        "op": "download",
+                        "remote": remote_path,
+                        "local": local_path,
+                        "compressed": True,
+                    }
+                    if chunked:
+                        event["chunked"] = True
+                    state.history.log_event(name, "file_operation", event)
+                    suffix = ", chunked" if chunked else ""
+                    typer.echo(
+                        f"[colab] Downloaded '{remote_path}' to '{local_path}' "
+                        f"(gzip-compressed in transit{suffix})"
                     )
-                    chunked = True
-                else:
-                    contents.download(gz_remote, tmp_gz)
-
-                with gzip.open(tmp_gz, "rb") as src, open(local_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-
-                actual_size = os.path.getsize(local_path)
-                if actual_size != int(remote_size):
-                    raise RuntimeError(
-                        f"Size mismatch after decompression: "
-                        f"expected {remote_size}, got {actual_size}"
-                    )
-
-                contents.rm(gz_remote)
-
-                event = {
-                    "op": "download",
-                    "remote": remote_path,
-                    "local": local_path,
-                    "compressed": True,
-                }
-                if chunked:
-                    event["chunked"] = True
-                state.history.log_event(name, "file_operation", event)
-                suffix = ", chunked" if chunked else ""
-                typer.echo(
-                    f"[colab] Downloaded '{remote_path}' to '{local_path}' "
-                    f"(gzip-compressed in transit{suffix})"
+                finally:
+                    if os.path.exists(tmp_gz):
+                        os.remove(tmp_gz)
+            elif remote_size is not None and int(remote_size) > TRANSFER_PART_BYTES:
+                _download_chunked(
+                    state,
+                    name,
+                    current_session,
+                    contents,
+                    remote_path,
+                    local_path,
+                    int(remote_size),
                 )
-            finally:
-                if os.path.exists(tmp_gz):
-                    os.remove(tmp_gz)
-        elif remote_size is not None and int(remote_size) > TRANSFER_PART_BYTES:
-            _download_chunked(
-                state, name, s, contents, remote_path, local_path, int(remote_size)
-            )
-            state.history.log_event(
-                name,
-                "file_operation",
-                {
-                    "op": "download",
-                    "remote": remote_path,
-                    "local": local_path,
-                    "chunked": True,
-                },
-            )
-            typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}' in chunks")
-        else:
-            contents.download(remote_path, local_path)
-            state.history.log_event(
-                name,
-                "file_operation",
-                {"op": "download", "remote": remote_path, "local": local_path},
-            )
-            typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}'")
+                state.history.log_event(
+                    name,
+                    "file_operation",
+                    {
+                        "op": "download",
+                        "remote": remote_path,
+                        "local": local_path,
+                        "chunked": True,
+                    },
+                )
+                typer.echo(
+                    f"[colab] Downloaded '{remote_path}' to '{local_path}' in chunks"
+                )
+            else:
+                contents.download(remote_path, local_path)
+                state.history.log_event(
+                    name,
+                    "file_operation",
+                    {"op": "download", "remote": remote_path, "local": local_path},
+                )
+                typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}'")
+
+        state.run_with_runtime_proxy_retry(name, transfer)
     except Exception as e:
         typer.echo(f"[colab] Download failed: {e}")
         raise typer.Exit(1)
@@ -509,12 +532,9 @@ def edit(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    s = state.store.get(name)
-    if not s:
+    if not state.store.get(name):
         typer.echo(f"[colab] Session '{name}' not found.")
         raise typer.Exit(1)
-
-    contents = ContentsClient(s)
 
     def get_file_hash(path):
         if not os.path.exists(path):
@@ -528,7 +548,9 @@ def edit(
         local_path = tf.name
 
         try:
-            contents.download(remote_path, local_path)
+            state.run_with_runtime_proxy_retry(
+                name, lambda s: ContentsClient(s).download(remote_path, local_path)
+            )
         except Exception:
             # If download fails, assume file doesn't exist and start empty
             pass
@@ -540,7 +562,9 @@ def edit(
         hash_after = get_file_hash(local_path)
 
         if hash_after != hash_before:
-            contents.upload(local_path, remote_path)
+            state.run_with_runtime_proxy_retry(
+                name, lambda s: ContentsClient(s).upload(local_path, remote_path)
+            )
             state.history.log_event(
                 name,
                 "file_operation",

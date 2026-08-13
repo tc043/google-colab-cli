@@ -37,6 +37,9 @@ def mock_session():
 def test_cli_auth(mock_state, mock_runtime_class, mock_session):
     mock_state.store.get.return_value = mock_session
     mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(mock_session)
+    )
 
     mock_runtime = mock_runtime_class.return_value
     mock_runtime.execute_code.return_value = [{"text": "Success"}]
@@ -47,7 +50,12 @@ def test_cli_auth(mock_state, mock_runtime_class, mock_session):
     assert mock_session.last_execution[0] == "automation:auth"
     assert mock_session.last_execution[1] is None
     assert mock_session.last_execution[2] is not None
-    mock_state.store.add.assert_called_with(mock_session)
+    mock_state.store.update_fields.assert_any_call(
+        "test-session",
+        "e1",
+        running="automation(auth)",
+        last_execution=mock_session.last_execution,
+    )
 
     # Verify ColabRuntime was invoked with the correct code
     mock_runtime.execute_code.assert_called_once()
@@ -62,6 +70,9 @@ def test_cli_auth(mock_state, mock_runtime_class, mock_session):
 def test_cli_install(mock_state, mock_runtime_class, mock_session):
     mock_state.store.get.return_value = mock_session
     mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(mock_session)
+    )
 
     mock_runtime = mock_runtime_class.return_value
     mock_runtime.execute_code.return_value = [{"text": "Installed"}]
@@ -70,7 +81,12 @@ def test_cli_install(mock_state, mock_runtime_class, mock_session):
     assert result.exit_code == 0
     assert mock_session.last_execution[0] == "automation:install"
     assert mock_session.last_execution[2] is not None
-    mock_state.store.add.assert_called_with(mock_session)
+    mock_state.store.update_fields.assert_any_call(
+        "test-session",
+        "e1",
+        running="automation(install)",
+        last_execution=mock_session.last_execution,
+    )
 
     mock_runtime.execute_code.assert_called_once()
     called_code = mock_runtime.execute_code.call_args[0][0]
@@ -86,6 +102,9 @@ def test_cli_install(mock_state, mock_runtime_class, mock_session):
 def test_cli_drivemount(mock_state, mock_runtime_class, mock_session):
     mock_state.store.get.return_value = mock_session
     mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(mock_session)
+    )
 
     mock_runtime = mock_runtime_class.return_value
     mock_runtime.execute_code.return_value = [{"text": "Mounted"}]
@@ -119,6 +138,9 @@ def test_cli_auth_uses_long_timeout(mock_state, mock_runtime_class, mock_session
     runtime.execute_code or the call will TimeoutError mid-flow."""
     mock_state.store.get.return_value = mock_session
     mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(mock_session)
+    )
 
     mock_runtime = mock_runtime_class.return_value
     mock_runtime.execute_code.return_value = [{"text": "Authenticated"}]
@@ -151,6 +173,9 @@ def test_drivefs_hook_reads_enter_without_dev_tty(
     without credentials and mount failed."""
     mock_state.store.get.return_value = mock_session
     mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(mock_session)
+    )
 
     creds = MagicMock()
     creds.request.side_effect = [
@@ -188,3 +213,38 @@ def test_drivefs_hook_reads_enter_without_dev_tty(
     sent = wsclient.stdin_channel.send.call_args[0][0]
     assert sent["value"]["colab_msg_id"] == "mid-1"
     assert sent["parent_header"] == {"msg_id": "h1"}
+
+
+@patch("colab_cli.commands.automation.ContentsClient")
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_cli_install_requirement_upload_uses_refreshed_session(
+    mock_state, mock_runtime_class, mock_contents_class, tmp_path
+):
+    stale = SessionState(
+        name="test-session",
+        token="expired-token",
+        url="https://old.url",
+        endpoint="e1",
+    )
+    fresh = stale.model_copy(
+        update={"token": "fresh-token", "url": "https://fresh.url"}
+    )
+    requirement = tmp_path / "requirements.txt"
+    requirement.write_text("pandas\n")
+    mock_state.store.get.return_value = stale
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.run_with_runtime_proxy_retry.side_effect = lambda name, operation: (
+        operation(fresh)
+    )
+    mock_runtime_class.return_value.execute_code.return_value = []
+
+    result = runner.invoke(
+        app, ["install", "-s", "test-session", "-r", str(requirement)]
+    )
+
+    assert result.exit_code == 0, result.output
+    mock_contents_class.assert_called_once_with(fresh)
+    mock_contents_class.return_value.upload.assert_called_once_with(
+        str(requirement), "content/requirements.txt"
+    )

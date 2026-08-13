@@ -1,5 +1,6 @@
 ---
 log:
+2026-08-13: Fixed issue #106 for `exec`, `repl`, `console`, and `restart-kernel`: runtime startup proactively uses refreshed proxy credentials and retries one proxy-auth failure after a control-plane refresh. Terminal failures no longer unconditionally prune local state, and endpoint-guarded metadata cleanup prevents stale `finally` blocks from restoring expired tokens or reviving removed sessions.
 2026-05-07: Fixed `colab console` piped-stdin handling. Previously a piped invocation (e.g. `echo 'cmd' | colab console -s s`) sent the command and then hung indefinitely because the previous EOF handler emitted a bare `\x04` (Ctrl-D), which the remote `tmux`-wrapped bash treats as a literal character rather than a session terminator. The new handler sends `exit\n` (which bash actually exits on) and then closes the websocket from the client side after a short grace period (`PIPED_EOF_GRACE_SECONDS = 0.5s`) so any tail output (bash `logout`, tmux `[exited]`) makes it back to the user. TTY mode is unchanged: real-terminal EOF is left to the remote shell. Verified live: `echo 'echo HELLO' | colab console -s s` now exits in ~1.2s instead of hanging.
 
 2026-05-07: Fixed `print_kitty` (used by `colab exec --output-image` and any image-producing exec) to no-op when `sys.stdout.isatty()` is false. The Kitty Graphics Protocol escape sequence is meaningless when stdout is a file or pipe and was visually corrupting captured output (a multi-KB base64 PNG blob would land in log files, grep targets, or showboat captures). Image bytes are still saved to disk via `handle_image`'s file-write path; only the inline-render attempt is suppressed.
@@ -36,6 +37,12 @@ Execution involves sending Python code (or shell commands) to the Jupyter kernel
 - **Terminal Management**: Configures `sys.stdin` to raw mode using `termios` and `tty`, passing single characters to the socket and writing raw ANSI escape sequences directly to `sys.stdout.buffer`. Hooks into `SIGWINCH` to communicate local terminal dimensions (`cols`/`rows`) to the remote bash environment so output rendering works perfectly during resizing.
 - **Piped stdin**: Detected via `sys.stdin.isatty()`. When piped, the input characters are forwarded one at a time to the remote pty, and on EOF the client sends `exit\n` and then closes the websocket itself after `PIPED_EOF_GRACE_SECONDS` (0.5s) so the user's shell goodbye text drains back. The remote `/colab/tty` endpoint wraps bash in tmux, which intercepts a bare `\x04` as a literal character — that is why we send `exit\n` rather than Ctrl-D.
 
+### 4. Expired Runtime-Proxy Credentials
+
+- Session resolution adopts the latest runtime-proxy token and URL returned by `/tun/m/assignments` before Jupyter or terminal connection startup.
+- A proxy-auth 401/404 triggers one refresh-and-retry. A repeated failure is reported without deleting the local binding unless the assignments endpoint independently confirms the VM endpoint is gone.
+- Kernel/session ID callbacks and `running`/`last_execution` cleanup use endpoint-guarded field updates, so a stale command cannot overwrite a token refreshed by another invocation or recreate a deleted session. This specifically prevents the former Console `finally` resurrection path.
+
 ## Implementation Details
 - **Kernel Management**: `ColabRuntime` (from `colab-agent`) already handles message signing and message types.
 - **Output Streaming**: Continuous polling or asynchronous message handling to provide real-time output.
@@ -55,3 +62,5 @@ TDD is mandatory for all execution features.
 - **Test Case**: `colab console` with piped stdin sends `exit\n` and calls `ws.close()` on EOF (regression: previously sent `\x04` only and hung).
 - **Test Case**: `colab console` in TTY mode does not synthesize an exit on EOF (the user owns the session lifecycle).
 - **Test Case**: `print_kitty` is a no-op when `sys.stdout.isatty()` is false (regression: previously emitted ANSI/base64 into pipes and files).
+- **Test Case**: Runtime-proxy 401/404 startup failures refresh and retry once without unconditional pruning.
+- **Test Case**: Console and execution cleanup merge metadata into the latest endpoint-matching state and never revive a removed session.
