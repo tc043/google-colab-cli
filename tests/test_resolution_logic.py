@@ -157,6 +157,20 @@ def test_resolve_named_session_refreshes_runtime_proxy(tmp_path):
     assert refreshed.kernel_id == "kernel-1"
 
 
+def test_refresh_session_forwards_request_timeout(tmp_path):
+    store = StateStore(str(tmp_path / "sessions.json"))
+    original = SessionState(name="s1", token="old", url="old", endpoint="e1")
+    store.add(original)
+    state = State()
+    state._store = store
+    state._client = MagicMock()
+    state._client.list_assignments.return_value = [_listed_assignment()]
+
+    state.refresh_session("s1", expected_session=original, timeout=10)
+
+    state._client.list_assignments.assert_called_once_with(timeout=10)
+
+
 def test_resolve_named_session_removes_binding_only_when_server_confirms_missing(
     tmp_path,
 ):

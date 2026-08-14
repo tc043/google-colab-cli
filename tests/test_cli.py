@@ -417,8 +417,29 @@ def test_cli_console(mock_store, mock_common_state):
         refresh_session = mock_connect.call_args.kwargs["refresh_session"]
         refresh_session(mock_session_state)
         mock_common_state.refresh_session.assert_called_once_with(
-            "s1", expected_session=mock_session_state
+            "s1", expected_session=mock_session_state, timeout=10
         )
+
+
+def test_cli_console_reconnect_stops_without_http_after_local_stop(
+    mock_store, mock_common_state
+):
+    """A concurrent `colab stop` is already conclusive local evidence."""
+    mock_session_state = MagicMock()
+    mock_session_state.name = "s1"
+    mock_session_state.endpoint = "endpoint-1"
+    mock_store.get.return_value = mock_session_state
+    mock_common_state.resolve_session.return_value = "s1"
+
+    with patch("colab_cli.commands.execution.connect_console") as mock_connect:
+        result = runner.invoke(app, ["console", "-s", "s1"])
+
+    assert result.exit_code == 0
+    refresh_session = mock_connect.call_args.kwargs["refresh_session"]
+    mock_store.get.return_value = None
+
+    assert refresh_session(mock_session_state) is None
+    mock_common_state.refresh_session.assert_not_called()
 
 
 def test_cli_console_auth_failure_does_not_prune_or_revive(

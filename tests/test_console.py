@@ -567,6 +567,17 @@ def test_console_input_forwarder_drains_buffered_input_without_waiting_for_eof()
     ]
 
 
+def test_console_ctrl_c_during_reconnect_is_visible(capsys):
+    """Raw-mode Ctrl-C cancellation must not look like another silent freeze."""
+    forwarder = _ConsoleInputForwarder(is_tty=True)
+
+    forwarder._forward_char("\x03")
+
+    assert forwarder.user_requested_close is True
+    assert forwarder.stop_event.is_set()
+    assert "Console reconnect cancelled by user" in capsys.readouterr().err
+
+
 def test_console_real_loopback_reconnect_uses_refreshed_token(
     mock_session, monkeypatch, capsys
 ):

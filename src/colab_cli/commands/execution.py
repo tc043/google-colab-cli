@@ -30,12 +30,31 @@ from colab_cli.utils import handle_image, is_runtime_proxy_error, render_display
 
 _console = Console()
 
+CONSOLE_REFRESH_TIMEOUT_SECONDS = 10
+
 TITLE_REGEX = re.compile(r"^\s*#\s*@title\s+(.*)", re.MULTILINE)
 ENV_KEY_REGEX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def is_stdin_tty():
     return sys.stdin.isatty()
+
+
+def _refresh_console_session(state, name, expected):
+    """Refreshes one Console binding without reviving a locally stopped VM."""
+    current = state.store.get(name)
+    if current is None:
+        # `colab stop` removes the endpoint only after unassign succeeds, so a
+        # missing local binding is already conclusive and needs no HTTP lookup.
+        return None
+    if current.endpoint != expected.endpoint:
+        # Let Console's endpoint guard report and reject the replacement.
+        return current
+    return state.refresh_session(
+        name,
+        expected_session=current,
+        timeout=CONSOLE_REFRESH_TIMEOUT_SECONDS,
+    )
 
 
 def _parse_env_vars(env: Optional[List[str]]) -> dict[str, str]:
@@ -390,8 +409,8 @@ def console(
             name,
             lambda current: connect_console(
                 current,
-                refresh_session=lambda expected: state.refresh_session(
-                    name, expected_session=expected
+                refresh_session=lambda expected: _refresh_console_session(
+                    state, name, expected
                 ),
             ),
         )

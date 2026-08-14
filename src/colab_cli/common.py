@@ -129,14 +129,16 @@ class State:
         self,
         name: str,
         expected_session: Optional[SessionState] = None,
+        timeout: Optional[float] = None,
     ):
         """Fetches and adopts the current runtime-proxy credentials."""
         s = expected_session or self.store.get(name)
         if s is None:
             return None
+        request_kwargs = {"timeout": timeout} if timeout is not None else {}
         return self._refresh_session_from_assignments(
             name,
-            self.client.list_assignments(),
+            self.client.list_assignments(**request_kwargs),
             expected_session=s,
         )
 

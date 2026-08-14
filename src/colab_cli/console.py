@@ -416,6 +416,7 @@ class _ConsoleInputForwarder:
             if self.is_tty and char == "\x03":
                 self.user_requested_close = True
                 self.stop_event.set()
+                _status("Console reconnect cancelled by user.")
             return
 
         if self.is_tty:
