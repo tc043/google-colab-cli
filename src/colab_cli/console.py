@@ -65,6 +65,16 @@ CONSOLE_PING_TIMEOUT_SECONDS = 10
 # retry cadence until the user cancels or Colab confirms that the VM is gone.
 CONSOLE_RETRY_DELAYS_SECONDS = (1, 2, 5, 10, 30)
 
+# Shell-exit input is only a hint: ``exit`` may leave a nested shell and
+# Ctrl-D may close a foreground program without closing the Console transport.
+# Suppress reconnect only when the peer closes immediately after that input.
+CONSOLE_SHELL_EXIT_INTENT_SECONDS = 2
+
+# Treat an established socket that survives this long as a recovered
+# connection. A later outage starts a fresh backoff sequence instead of
+# inheriting the retry delay from an unrelated earlier outage.
+CONSOLE_STABLE_CONNECTION_SECONDS = 30
+
 _NORMAL_CLOSE_CODES = (1000, 1001)
 
 
@@ -161,6 +171,7 @@ class _Attempt:
     close_code: Optional[int] = None
     close_reason: str = ""
     opened_at: Optional[float] = None
+    duration: float = 0.0
 
     @property
     def abnormal(self) -> bool:
@@ -194,7 +205,8 @@ class _ConsoleInputForwarder:
     def __init__(self, is_tty: bool):
         self.is_tty = is_tty
         self.stop_event = threading.Event()
-        self.user_requested_close = False
+        self._user_requested_close = False
+        self._shell_close_intent_deadline: Optional[float] = None
         self._active_event = threading.Event()
         self._lock = threading.Lock()
         self._ws = None
@@ -254,17 +266,44 @@ class _ConsoleInputForwarder:
                 return True
         return False
 
+    @property
+    def user_requested_close(self) -> bool:
+        """Whether this close should terminate rather than reconnect."""
+        if self._user_requested_close:
+            return True
+        deadline = self._shell_close_intent_deadline
+        if deadline is None:
+            return False
+        if time.monotonic() <= deadline:
+            return True
+        self._shell_close_intent_deadline = None
+        return False
+
+    @user_requested_close.setter
+    def user_requested_close(self, value: bool) -> None:
+        # Retain the attribute-style API for permanent cancellation paths and
+        # compatibility with existing callers/tests. Shell command detection
+        # uses the bounded intent helper below instead.
+        self._user_requested_close = value
+        if not value:
+            self._shell_close_intent_deadline = None
+
+    def _mark_shell_close_intent(self) -> None:
+        self._shell_close_intent_deadline = (
+            time.monotonic() + CONSOLE_SHELL_EXIT_INTENT_SECONDS
+        )
+
     def _track_exit_request(self, char: str) -> None:
         if char in ("\r", "\n"):
             command = "".join(self._line).strip()
             if command in ("exit", "logout") or command.startswith("exit "):
-                self.user_requested_close = True
+                self._mark_shell_close_intent()
             self._line.clear()
         elif char in ("\x7f", "\b"):
             if self._line:
                 self._line.pop()
         elif char == "\x04":
-            self.user_requested_close = True
+            self._mark_shell_close_intent()
         elif char.isprintable():
             self._line.append(char)
 
@@ -424,6 +463,7 @@ def connect_console(
     original_endpoint = session.endpoint
     delays = _retry_delays(retry_delays)
     reconnect_attempt = 0
+    total_reconnect_attempts = 0
     active_ws = {"ws": None}
     pid = os.getpid()
 
@@ -496,7 +536,7 @@ def connect_console(
                     attempt.close_reason = close_msg or ""
                 active_ws["ws"] = None
                 forwarder.detach(ws)
-                duration = (
+                attempt.duration = (
                     time.monotonic() - attempt.opened_at
                     if attempt.opened_at is not None
                     else 0.0
@@ -509,7 +549,7 @@ def connect_console(
                     reconnect_attempt,
                     close_status_code,
                     close_msg or "",
-                    duration,
+                    attempt.duration,
                 )
 
             ws = websocket.WebSocketApp(
@@ -532,6 +572,10 @@ def connect_console(
             if forwarder.user_requested_close or not attempt.abnormal:
                 break
 
+            if attempt.opened and attempt.duration >= CONSOLE_STABLE_CONNECTION_SECONDS:
+                reconnect_attempt = 0
+                delays = _retry_delays(retry_delays)
+
             if not attempt.opened and isinstance(attempt.error, Exception):
                 if is_runtime_proxy_error(attempt.error):
                     # Let State's bounded startup retry refresh an expired
@@ -544,17 +588,18 @@ def connect_console(
 
             if (
                 _max_reconnect_attempts is not None
-                and reconnect_attempt >= _max_reconnect_attempts
+                and total_reconnect_attempts >= _max_reconnect_attempts
             ):
                 raise ConsoleConnectionError(
                     "Console reconnect limit reached after "
-                    f"{reconnect_attempt} attempt(s): {attempt.description()}"
+                    f"{total_reconnect_attempts} attempt(s): "
+                    f"{attempt.description()}"
                 )
 
-            if reconnect_attempt == 0:
-                _status(f"Console connection lost: {attempt.description()}.")
+            _status(f"Console connection lost: {attempt.description()}.")
 
             reconnect_attempt += 1
+            total_reconnect_attempts += 1
             delay = next(delays)
             _status(
                 f"Reconnecting in {delay:g}s (attempt {reconnect_attempt}; "

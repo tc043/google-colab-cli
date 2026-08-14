@@ -19,7 +19,7 @@
 # marker command, and exits normally. Existing assignments are only snapshotted
 # and must be unchanged after the isolated test assignment is removed.
 
-set -eu
+set -euo pipefail
 
 TMP_DIR=$(mktemp -d)
 SESSION_FILE="$TMP_DIR/sessions.json"
@@ -52,10 +52,23 @@ server_endpoints() {
 BEFORE_ENDPOINTS=$(server_endpoints)
 
 cleanup() {
-    if [ -n "$TEST_ENDPOINT" ]; then
-        uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME" >/dev/null 2>&1 || true
-        if server_endpoints | grep -Fxq "$TEST_ENDPOINT"; then
-            uv run python - "$AUTH_PROVIDER" "$TEST_ENDPOINT" <<'PY' >/dev/null 2>&1 || true
+    exit_code=$?
+    cleanup_endpoint="$TEST_ENDPOINT"
+    if [ -z "$cleanup_endpoint" ] && [ -s "$SESSION_FILE" ]; then
+        cleanup_endpoint=$(uv run python - "$SESSION_FILE" "$SESSION_NAME" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get("endpoint", ""))
+PY
+        )
+    fi
+
+    # `new` may have succeeded even if the first endpoint read failed. Always
+    # stop by the isolated name, then unassign the exact recovered endpoint.
+    uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME" >/dev/null 2>&1 || true
+    if [ -n "$cleanup_endpoint" ]; then
+        uv run python - "$AUTH_PROVIDER" "$cleanup_endpoint" <<'PY' >/dev/null 2>&1 || true
 import sys
 from colab_cli.auth import AuthProvider
 from colab_cli.common import state
@@ -63,9 +76,14 @@ from colab_cli.common import state
 state.auth_provider = AuthProvider(sys.argv[1])
 state.client.unassign(sys.argv[2])
 PY
-        fi
+    fi
+    if [ "$exit_code" -ne 0 ] && [ -s "$OUTPUT_FILE" ]; then
+        echo "[FAILURE] Captured Console probe output:" >&2
+        sed 's/^/  /' "$OUTPUT_FILE" >&2
     fi
     rm -rf "$TMP_DIR"
+    trap - EXIT
+    exit "$exit_code"
 }
 trap cleanup EXIT
 
@@ -95,7 +113,7 @@ if [ "$TEST_ACCELERATOR" != "NONE" ]; then
 fi
 
 echo "[*] Forcing one abnormal Console disconnect on CPU endpoint $TEST_ENDPOINT..."
-timeout 60 uv run python - "$AUTH_PROVIDER" "$SESSION_FILE" "$SESSION_NAME" >"$OUTPUT_FILE" 2>&1 <<'PY'
+timeout 120 uv run python - "$AUTH_PROVIDER" "$SESSION_FILE" "$SESSION_NAME" >"$OUTPUT_FILE" 2>&1 <<'PY'
 import os
 import pty
 import sys
@@ -150,7 +168,10 @@ console.websocket.WebSocketApp = websocket_app
 
 
 def drive_reconnected_shell():
-    if not second_open.wait(25):
+    # Assignment refresh traverses the external proxy and may occasionally be
+    # slow. Keep this below the outer timeout, but do not cancel a healthy
+    # reconnect merely because the control-plane lookup took over 25 seconds.
+    if not second_open.wait(90):
         os.write(master_fd, b"\x03")
         return
     os.write(master_fd, b"printf 'COLAB_CONSOLE_RECONNECT_OK\\n'\nexit\n")

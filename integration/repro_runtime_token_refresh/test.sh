@@ -17,7 +17,7 @@
 # deliberately invalid saved runtime-proxy token; session resolution must adopt
 # the fresh token returned by /tun/m/assignments before touching the VM.
 
-set -eu
+set -euo pipefail
 
 TMP_DIR=$(mktemp -d)
 SESSION_FILE="$TMP_DIR/sessions.json"
@@ -52,10 +52,24 @@ server_endpoints() {
 BEFORE_ENDPOINTS=$(server_endpoints)
 
 cleanup() {
-    if [ -n "$TEST_ENDPOINT" ]; then
-        uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME" >/dev/null 2>&1 || true
-        if server_endpoints | grep -Fxq "$TEST_ENDPOINT"; then
-            uv run python - "$AUTH_PROVIDER" "$TEST_ENDPOINT" <<'PY' >/dev/null 2>&1 || true
+    cleanup_endpoint="$TEST_ENDPOINT"
+    if [ -z "$cleanup_endpoint" ] && [ -s "$SESSION_FILE" ]; then
+        cleanup_endpoint=$(uv run python - "$SESSION_FILE" "$SESSION_NAME" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get("endpoint", ""))
+PY
+        )
+    fi
+
+    # Always try the isolated local binding: `new` may have succeeded even if
+    # the immediately-following endpoint read failed under `set -e`.
+    uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME" >/dev/null 2>&1 || true
+    if [ -n "$cleanup_endpoint" ]; then
+        # Exact, idempotent fallback. Do not gate cleanup on another assignments
+        # listing: that lookup may be the failure that triggered this trap.
+        uv run python - "$AUTH_PROVIDER" "$cleanup_endpoint" <<'PY' >/dev/null 2>&1 || true
 import sys
 from colab_cli.auth import AuthProvider
 from colab_cli.common import state
@@ -63,7 +77,6 @@ from colab_cli.common import state
 state.auth_provider = AuthProvider(sys.argv[1])
 state.client.unassign(sys.argv[2])
 PY
-        fi
     fi
     rm -rf "$TMP_DIR"
 }

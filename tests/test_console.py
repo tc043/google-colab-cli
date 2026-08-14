@@ -23,7 +23,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import websocket
@@ -348,6 +348,72 @@ def test_console_user_exit_does_not_reconnect(_mock_isatty, mock_ws_app, mock_se
         _connect_as_tty(mock_session, retry_delays=(0,), _max_reconnect_attempts=1)
 
     assert mock_ws_app.call_count == 1
+
+
+@pytest.mark.parametrize("command", ["exit\n", "logout\n", "\x04"])
+def test_console_shell_exit_intent_expires(command):
+    """Nested-shell exit input must not disable reconnect for the process lifetime."""
+    forwarder = _ConsoleInputForwarder(is_tty=True)
+
+    with patch("colab_cli.console.time.monotonic", return_value=10.0):
+        for char in command:
+            forwarder._track_exit_request(char)
+
+    with patch("colab_cli.console.time.monotonic", return_value=11.9):
+        assert forwarder.user_requested_close is True
+    with patch("colab_cli.console.time.monotonic", return_value=12.1):
+        assert forwarder.user_requested_close is False
+
+
+@patch("colab_cli.console.websocket.WebSocketApp")
+@patch("colab_cli.console.sys.stdin.isatty", return_value=True)
+def test_console_stable_connection_resets_retry_backoff(
+    _mock_isatty, mock_ws_app, mock_session, capsys
+):
+    """A later independent outage starts a fresh visible retry sequence."""
+    attempts = iter(
+        [
+            _websocket_attempt(close_code=1006, close_reason="first loss"),
+            _websocket_attempt(close_code=1006, close_reason="short recovery"),
+            _websocket_attempt(close_code=1006, close_reason="later loss"),
+            _websocket_attempt(close_code=1000, close_reason="shell exited"),
+        ]
+    )
+
+    def make_ws(**kwargs):
+        ws = next(attempts)
+        ws._on_open = kwargs["on_open"]
+        ws._on_error = kwargs["on_error"]
+        ws._on_close = kwargs["on_close"]
+        return ws
+
+    mock_ws_app.side_effect = make_ws
+    forwarder = MagicMock()
+    forwarder.stop_event.is_set.return_value = False
+    forwarder.stop_event.wait.return_value = False
+    forwarder.user_requested_close = False
+
+    with (
+        patch("colab_cli.console._ConsoleInputForwarder", return_value=forwarder),
+        # Each attempt records an open and close time. The third connection is
+        # healthy for 31 seconds, so its later loss starts a new retry series.
+        patch(
+            "colab_cli.console.time.monotonic",
+            side_effect=[0, 1, 2, 3, 4, 35, 36, 37],
+        ),
+    ):
+        _connect_as_tty(
+            mock_session,
+            refresh_session=MagicMock(return_value=mock_session),
+            retry_delays=(1, 2),
+            _max_reconnect_attempts=3,
+        )
+
+    assert forwarder.stop_event.wait.call_args_list == [call(1), call(2), call(1)]
+    stderr = capsys.readouterr().err
+    assert stderr.count("Console connection lost") == 3
+    assert stderr.count("Reconnecting in 1s (attempt 1") == 2
+    assert "Reconnecting in 2s (attempt 2" in stderr
 
 
 @patch("colab_cli.console.websocket.WebSocketApp")
