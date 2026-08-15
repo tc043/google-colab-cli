@@ -694,6 +694,26 @@ def test_on_message_writes_to_stdout(mock_flush, mock_write):
     # Verify that the data is written exactly as received
     mock_write.assert_called_once_with(test_data.encode("utf-8"))
     mock_flush.assert_called_once()
+    mock_ws.send.assert_not_called()
+
+
+@patch("colab_cli.console.sys.stdout.buffer.write")
+@patch("colab_cli.console.sys.stdout.buffer.flush")
+def test_on_message_acknowledges_pty_flow_control(mock_flush, mock_write):
+    """The raw /colab/tty peer pauses after six unacknowledged output chunks."""
+    mock_ws = MagicMock()
+    message_json = json.dumps({"data": "flow-controlled output", "ack": True})
+    events = []
+    mock_write.side_effect = lambda _data: events.append("write")
+    mock_flush.side_effect = lambda: events.append("flush")
+    mock_ws.send.side_effect = lambda _payload: events.append("ack")
+
+    on_message(mock_ws, message_json)
+
+    mock_write.assert_called_once_with(b"flow-controlled output")
+    mock_flush.assert_called_once()
+    mock_ws.send.assert_called_once_with(json.dumps({"ack": True}))
+    assert events == ["write", "flush", "ack"]
 
 
 @patch("colab_cli.console.os.get_terminal_size")

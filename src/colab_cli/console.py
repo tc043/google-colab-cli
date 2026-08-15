@@ -84,7 +84,7 @@ class ConsoleConnectionError(RuntimeError):
 
 def on_message(ws, message):
     """Compatibility callback for writing remote terminal output."""
-    _write_terminal_message(message)
+    _write_terminal_message(ws, message)
 
 
 def on_error(ws, error):
@@ -140,14 +140,17 @@ def on_open(ws):
     threading.Thread(target=read_stdin, daemon=True).start()
 
 
-def _write_terminal_message(message) -> None:
+def _write_terminal_message(ws, message) -> None:
+    """Writes terminal output and acknowledges the server's PTY flow control."""
     try:
         data = json.loads(message)
         if "data" in data:
             sys.stdout.buffer.write(data["data"].encode("utf-8"))
             sys.stdout.buffer.flush()
+        if data.get("ack") is True:
+            ws.send(json.dumps({"ack": True}))
     except Exception as e:
-        logger.debug("Error parsing Console message: %s", e)
+        logger.debug("Error handling Console message: %s", e)
 
 
 def _status(message: str) -> None:
@@ -502,7 +505,7 @@ def connect_console(
                     )
 
             def attempt_message(ws, message):
-                _write_terminal_message(message)
+                _write_terminal_message(ws, message)
 
             def attempt_error(ws, error):
                 # websocket-client 1.9 passes a received ABNF close frame to

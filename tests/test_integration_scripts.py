@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LIVE_SCRIPTS = (
     REPO_ROOT / "integration/repro_runtime_token_refresh/test.sh",
     REPO_ROOT / "integration/repro_console_reconnect/test.sh",
+    REPO_ROOT / "integration/repro_console_flow_control/test.sh",
 )
 
 
