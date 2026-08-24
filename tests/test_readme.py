@@ -90,3 +90,57 @@ def test_readme_failure(mock_resources):
         result = runner.invoke(app, ["README"])
         assert result.exit_code == 1
         assert "README.md content not available" in result.output
+
+
+def test_skill_unicode_content(mock_resources):
+    """Non-ASCII content must not raise UnicodeEncodeError (Windows cp1252)."""
+    mock_skill = MagicMock()
+    mock_skill.is_file.return_value = True
+    mock_skill.read_text.return_value = "path \u2192 target \u2713"
+
+    def joinpath_side_effect(name):
+        if name == "SKILL.md":
+            return mock_skill
+        return MagicMock(is_file=MagicMock(return_value=False))
+
+    mock_resources.return_value.joinpath.side_effect = joinpath_side_effect
+
+    result = runner.invoke(app, ["skill"])
+    assert result.exit_code == 0
+    assert "\u2192" in result.output
+    assert "\u2713" in result.output
+
+
+def test_print_resource_falls_back_without_buffer(mock_resources, monkeypatch):
+    """If sys.stdout has no .buffer (e.g. captured text streams), still echo."""
+    import colab_cli.commands.utility as utility
+    import io
+
+    class NoBufferStream:
+        def __init__(self):
+            self._text = io.StringIO()
+
+        def write(self, text):
+            return self._text.write(text)
+
+        def flush(self):
+            pass
+
+        def getvalue(self):
+            return self._text.getvalue()
+
+    mock_skill = MagicMock()
+    mock_skill.is_file.return_value = True
+    mock_skill.read_text.return_value = "Fake SKILL content"
+
+    def joinpath_side_effect(name):
+        if name == "SKILL.md":
+            return mock_skill
+        return MagicMock(is_file=MagicMock(return_value=False))
+
+    mock_resources.return_value.joinpath.side_effect = joinpath_side_effect
+
+    stream = NoBufferStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    utility._print_resource("SKILL.md")
+    assert stream.getvalue().strip() == "Fake SKILL content"

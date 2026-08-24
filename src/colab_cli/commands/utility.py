@@ -405,7 +405,18 @@ def _print_resource(filename: str) -> None:
                 pass
 
     if content:
-        typer.echo(content)
+        # Write raw UTF-8 bytes instead of typer.echo: Windows consoles often
+        # run legacy codepages (e.g. cp1252) and echo would raise
+        # UnicodeEncodeError on characters like '\u2192'. The buffer path is
+        # byte-exact when piped/redirected.
+        import sys
+
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(content.encode("utf-8"))
+            buffer.flush()
+        else:
+            typer.echo(content)
     else:
         typer.echo(f"[colab] {filename} content not available.", err=True)
         raise typer.Exit(code=1)
