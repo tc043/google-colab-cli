@@ -29,7 +29,7 @@ from colab_cli.runtime import ColabRuntime
 # large (~100MB observed). Files above this threshold are gzipped locally,
 # uploaded as "<remote>.gz", decompressed on the VM via the kernel, verified
 # against the original size, and cleaned up.
-UPLOAD_COMPRESS_ABOVE_BYTES = 64 * 1024 * 1024
+TRANSFER_COMPRESS_ABOVE_BYTES = 64 * 1024 * 1024
 
 
 def ls(
@@ -103,13 +103,16 @@ def _upload_compressed(state, name, s, contents, local_path, remote_path):
         runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
         rp = repr(remote_path)
         gp = repr(gz_remote)
-        runtime.execute_code(
-            "import gzip, os, shutil\n"
-            f"os.makedirs(os.path.dirname({rp}) or '/', exist_ok=True)\n"
-            f"with gzip.open({gp}, 'rb') as src, open({rp}, 'wb') as dst:\n"
-            "    shutil.copyfileobj(src, dst)\n"
-            f"print('decompressed', {rp}, os.path.getsize({rp}))"
-        )
+        try:
+            runtime.execute_code(
+                "import gzip, os, shutil\n"
+                f"os.makedirs(os.path.dirname({rp}) or '/', exist_ok=True)\n"
+                f"with gzip.open({gp}, 'rb') as src, open({rp}, 'wb') as dst:\n"
+                "    shutil.copyfileobj(src, dst)\n"
+                f"print('decompressed', {rp}, os.path.getsize({rp}))"
+            )
+        finally:
+            runtime.stop()
 
         meta = contents.list_dir(remote_path)
         remote_size = meta.get("size") if isinstance(meta, dict) else None
@@ -161,7 +164,7 @@ def upload(
         raise typer.Exit(1)
     contents = ContentsClient(s)
     try:
-        if not no_compress and os.path.getsize(local_path) > UPLOAD_COMPRESS_ABOVE_BYTES:
+        if not no_compress and os.path.getsize(local_path) > TRANSFER_COMPRESS_ABOVE_BYTES:
             _upload_compressed(state, name, s, contents, local_path, remote_path)
         else:
             contents.upload(local_path, remote_path)
@@ -176,6 +179,51 @@ def upload(
         raise typer.Exit(1)
 
 
+def _download_compressed(state, name, s, contents, remote_path, local_path, expected_size):
+    gz_remote = remote_path + ".gz"
+
+    runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
+    rp = repr(remote_path)
+    gp = repr(gz_remote)
+    try:
+        runtime.execute_code(
+            "import gzip, os, shutil\n"
+            f"with open({rp}, 'rb') as src, gzip.open({gp}, 'wb', compresslevel=6) as dst:\n"
+            "    shutil.copyfileobj(src, dst)\n"
+            f"print('compressed', {gp}, os.path.getsize({gp}))"
+        )
+    finally:
+        runtime.stop()
+
+    fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+    os.close(fd)
+    try:
+        contents.download(gz_remote, tmp_gz)
+        with gzip.open(tmp_gz, "rb") as src, open(local_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+        actual_size = os.path.getsize(local_path)
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"Size mismatch after decompression: expected {expected_size}, got {actual_size}"
+            )
+
+        contents.rm(gz_remote)
+
+        state.history.log_event(
+            name,
+            "file_operation",
+            {"op": "download", "remote": remote_path, "local": local_path, "compressed": True},
+        )
+        typer.echo(
+            f"[colab] Downloaded '{remote_path}' to '{local_path}' "
+            "(gzip-compressed in transit)"
+        )
+    finally:
+        if os.path.exists(tmp_gz):
+            os.remove(tmp_gz)
+
+
 def download(
     session: Annotated[
         Optional[str], typer.Option("-s", "--session", help="Session name")
@@ -186,6 +234,13 @@ def download(
     local_path: Annotated[
         str, typer.Argument(help="Local path to save the file")
     ] = ...,
+    no_compress: Annotated[
+        bool,
+        typer.Option(
+            "--no-compress",
+            help="Disable automatic gzip transfer for large files",
+        ),
+    ] = False,
 ):
     """Download a file from a session"""
     from colab_cli.common import state
@@ -197,13 +252,24 @@ def download(
         raise typer.Exit(1)
     contents = ContentsClient(s)
     try:
-        contents.download(remote_path, local_path)
-        state.history.log_event(
-            name,
-            "file_operation",
-            {"op": "download", "remote": remote_path, "local": local_path},
-        )
-        typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}'")
+        meta = contents.list_dir(remote_path)
+        remote_size = meta.get("size") if isinstance(meta, dict) else None
+        if (
+            not no_compress
+            and remote_size is not None
+            and int(remote_size) > TRANSFER_COMPRESS_ABOVE_BYTES
+        ):
+            _download_compressed(
+                state, name, s, contents, remote_path, local_path, int(remote_size)
+            )
+        else:
+            contents.download(remote_path, local_path)
+            state.history.log_event(
+                name,
+                "file_operation",
+                {"op": "download", "remote": remote_path, "local": local_path},
+            )
+            typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}'")
     except Exception as e:
         typer.echo(f"[colab] Download failed: {e}")
         raise typer.Exit(1)
