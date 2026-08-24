@@ -53,7 +53,7 @@ def test_large_file_gzips_and_decompresses_on_vm(
 ):
     from colab_cli.commands import files
 
-    monkeypatch.setattr(files, "UPLOAD_COMPRESS_ABOVE_BYTES", 10)
+    monkeypatch.setattr(files, "TRANSFER_COMPRESS_ABOVE_BYTES", 10)
     payload = os.urandom(4096)
     local = tmp_path / "big.bin"
     local.write_bytes(payload)
@@ -86,7 +86,7 @@ def test_large_file_size_mismatch_fails(
 ):
     from colab_cli.commands import files
 
-    monkeypatch.setattr(files, "UPLOAD_COMPRESS_ABOVE_BYTES", 10)
+    monkeypatch.setattr(files, "TRANSFER_COMPRESS_ABOVE_BYTES", 10)
     local = tmp_path / "big.bin"
     local.write_bytes(os.urandom(4096))
     mock_contents.list_dir.return_value = {"size": 123}
@@ -102,7 +102,7 @@ def test_no_compress_flag_bypasses_gzip(
 ):
     from colab_cli.commands import files
 
-    monkeypatch.setattr(files, "UPLOAD_COMPRESS_ABOVE_BYTES", 10)
+    monkeypatch.setattr(files, "TRANSFER_COMPRESS_ABOVE_BYTES", 10)
     local = tmp_path / "big.bin"
     local.write_bytes(os.urandom(4096))
 
