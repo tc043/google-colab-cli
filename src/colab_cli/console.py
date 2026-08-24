@@ -17,10 +17,17 @@ import logging
 import os
 import signal
 import sys
-import termios
 import threading
 import time
-import tty
+
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:  # Windows: raw-TTY console mode unsupported
+    termios = None
+    tty = None
+    _HAS_TERMIOS = False
 from urllib.parse import urlparse
 
 import websocket
@@ -88,7 +95,7 @@ def on_open(ws):
 
     # Setup the background thread to read from stdin
     def read_stdin():
-        is_tty = sys.stdin.isatty()
+        is_tty = sys.stdin.isatty() and _HAS_TERMIOS
         while _is_running:
             try:
                 # Read a single character (or escape sequence byte)
@@ -132,7 +139,7 @@ def connect_console(session: SessionState):
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     ws_url = f"{ws_scheme}://{parsed.netloc}/colab/tty?colab-runtime-proxy-token={session.token}"
 
-    is_tty = sys.stdin.isatty()
+    is_tty = sys.stdin.isatty() and _HAS_TERMIOS
     fd = sys.stdin.fileno() if is_tty else None
     old_settings = termios.tcgetattr(fd) if is_tty else None
 
