@@ -48,6 +48,7 @@ from urllib.parse import urlparse
 import uuid
 
 from colab_cli.state import SessionState
+from colab_cli.utils import no_window_kwargs
 import typer
 from typing_extensions import Annotated
 import websocket
@@ -84,6 +85,7 @@ def _pubkey_from_identity(identity: str) -> str:
             check=True,
             capture_output=True,
             text=True,
+            **no_window_kwargs(),
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         typer.echo(

@@ -15,6 +15,7 @@
 import base64
 import html2text
 import logging
+import subprocess
 import sys
 import tempfile
 
@@ -22,6 +23,18 @@ from typing import Optional, Union
 
 from rich.markdown import Markdown
 from rich.text import Text
+
+
+def no_window_kwargs() -> dict:
+    """Extra kwargs for non-interactive subprocess calls on Windows.
+
+    Without CREATE_NO_WINDOW, console executables (git, ssh-keygen, ...)
+    spawned from a parent with no attached console (services, CI agents,
+    automation shells) each allocate a visible console window.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 
 def get_status_code(e: Exception) -> Optional[int]:
