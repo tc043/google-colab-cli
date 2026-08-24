@@ -35,6 +35,7 @@ import typer
 
 from colab_cli.common import state
 from colab_cli.state import Settings
+from colab_cli.utils import no_window_kwargs
 
 # PyPI distribution name (different from the importable package name `colab`).
 PYPI_PACKAGE_NAME = "google-colab-cli"
@@ -45,7 +46,7 @@ PYPI_PACKAGE_NAME = "google-colab-cli"
 
 def is_self_install_supported() -> bool:
     """Return True if self-install (--install) is supported on the current platform."""
-    return platform.system() in ("Linux", "Darwin")
+    return platform.system() in ("Linux", "Darwin", "Windows")
 
 
 def get_app_version() -> str:
@@ -60,6 +61,7 @@ def get_app_version() -> str:
             ["git", "rev-parse", "--short", "HEAD"],
             stderr=subprocess.DEVNULL,
             encoding="utf-8",
+            **no_window_kwargs(),
         ).strip()
     except Exception:
         return "unknown"

@@ -363,7 +363,7 @@ def update_command(
 
     if not auto_update.is_self_install_supported():
         typer.echo(
-            "[colab] '--install' self-install is only supported on Linux and macOS.",
+            "[colab] '--install' self-install is not supported on this platform.",
             err=True,
         )
         raise typer.Exit(code=1)
