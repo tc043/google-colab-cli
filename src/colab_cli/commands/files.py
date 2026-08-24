@@ -13,14 +13,23 @@
 # limitations under the License.
 
 import click
+import gzip
 import hashlib
 import os
+import shutil
 import tempfile
 import typer
 from typing import Optional
 from typing_extensions import Annotated
 
 from colab_cli.contents import ContentsClient
+from colab_cli.runtime import ColabRuntime
+
+# The runtime proxy tunnel resets connections when a single PUT body is too
+# large (~100MB observed). Files above this threshold are gzipped locally,
+# uploaded as "<remote>.gz", decompressed on the VM via the kernel, verified
+# against the original size, and cleaned up.
+UPLOAD_COMPRESS_ABOVE_BYTES = 64 * 1024 * 1024
 
 
 def ls(
@@ -79,12 +88,65 @@ def rm(
         raise typer.Exit(1)
 
 
+def _upload_compressed(state, name, s, contents, local_path, remote_path):
+    gz_remote = remote_path + ".gz"
+    expected_size = os.path.getsize(local_path)
+
+    fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+    os.close(fd)
+    try:
+        with open(local_path, "rb") as src, gzip.open(tmp_gz, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst)
+
+        contents.upload(tmp_gz, gz_remote)
+
+        runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
+        rp = repr(remote_path)
+        gp = repr(gz_remote)
+        runtime.execute_code(
+            "import gzip, os, shutil\n"
+            f"os.makedirs(os.path.dirname({rp}) or '/', exist_ok=True)\n"
+            f"with gzip.open({gp}, 'rb') as src, open({rp}, 'wb') as dst:\n"
+            "    shutil.copyfileobj(src, dst)\n"
+            f"print('decompressed', {rp}, os.path.getsize({rp}))"
+        )
+
+        meta = contents.list_dir(remote_path)
+        remote_size = meta.get("size") if isinstance(meta, dict) else None
+        if remote_size is not None and int(remote_size) != expected_size:
+            raise RuntimeError(
+                f"Size mismatch after decompression: expected {expected_size}, got {remote_size}"
+            )
+
+        contents.rm(gz_remote)
+
+        state.history.log_event(
+            name,
+            "file_operation",
+            {"op": "upload", "local": local_path, "remote": remote_path, "compressed": True},
+        )
+        typer.echo(
+            f"[colab] Uploaded '{local_path}' to '{remote_path}' "
+            "(gzip-compressed in transit, decompressed on VM)"
+        )
+    finally:
+        if os.path.exists(tmp_gz):
+            os.remove(tmp_gz)
+
+
 def upload(
     session: Annotated[
         Optional[str], typer.Option("-s", "--session", help="Session name")
     ] = None,
     local_path: Annotated[str, typer.Argument(help="Local file to upload")] = ...,
     remote_path: Annotated[str, typer.Argument(help="Remote path to upload to")] = ...,
+    no_compress: Annotated[
+        bool,
+        typer.Option(
+            "--no-compress",
+            help="Disable automatic gzip transfer for large files",
+        ),
+    ] = False,
 ):
     """Upload a file to a session"""
     from colab_cli.common import state
@@ -99,13 +161,16 @@ def upload(
         raise typer.Exit(1)
     contents = ContentsClient(s)
     try:
-        contents.upload(local_path, remote_path)
-        state.history.log_event(
-            name,
-            "file_operation",
-            {"op": "upload", "local": local_path, "remote": remote_path},
-        )
-        typer.echo(f"[colab] Uploaded '{local_path}' to '{remote_path}'")
+        if not no_compress and os.path.getsize(local_path) > UPLOAD_COMPRESS_ABOVE_BYTES:
+            _upload_compressed(state, name, s, contents, local_path, remote_path)
+        else:
+            contents.upload(local_path, remote_path)
+            state.history.log_event(
+                name,
+                "file_operation",
+                {"op": "upload", "local": local_path, "remote": remote_path},
+            )
+            typer.echo(f"[colab] Uploaded '{local_path}' to '{remote_path}'")
     except Exception as e:
         typer.echo(f"[colab] Upload failed: {e}")
         raise typer.Exit(1)

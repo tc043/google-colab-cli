@@ -15,12 +15,16 @@
 import json
 import os
 import sys
-import termios
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytest.importorskip("termios", reason="Unix-only raw TTY tests")
+
+import termios
 
 from colab_cli.console import connect_console, on_message, on_open
 from colab_cli.state import SessionState
-import pytest
 
 
 @pytest.fixture
