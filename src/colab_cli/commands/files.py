@@ -31,6 +31,12 @@ from colab_cli.runtime import ColabRuntime
 # against the original size, and cleaned up.
 TRANSFER_COMPRESS_ABOVE_BYTES = 64 * 1024 * 1024
 
+# Even a gzipped payload can stay above the tunnel's per-request limit
+# (incompressible data barely shrinks). Transfers whose payload still exceeds
+# this size are split into part files ("<remote>.clabpartNNNNN"), moved one
+# request at a time, and reassembled on the receiving side via the kernel.
+TRANSFER_PART_BYTES = 48 * 1024 * 1024
+
 
 def ls(
     session: Annotated[
@@ -109,7 +115,8 @@ def _upload_compressed(state, name, s, contents, local_path, remote_path):
                 f"os.makedirs(os.path.dirname({rp}) or '/', exist_ok=True)\n"
                 f"with gzip.open({gp}, 'rb') as src, open({rp}, 'wb') as dst:\n"
                 "    shutil.copyfileobj(src, dst)\n"
-                f"print('decompressed', {rp}, os.path.getsize({rp}))"
+                f"print('decompressed', {rp}, os.path.getsize({rp}))",
+                timeout=1800,
             )
         finally:
             runtime.stop()
@@ -135,6 +142,103 @@ def _upload_compressed(state, name, s, contents, local_path, remote_path):
     finally:
         if os.path.exists(tmp_gz):
             os.remove(tmp_gz)
+
+
+def _upload_chunked(
+    state,
+    name,
+    s,
+    contents,
+    transfer_path,
+    staging_remote,
+    final_remote,
+    expected_size,
+    display_local=None,
+):
+    """Upload a payload above the per-request ceiling as part files, then
+    concatenate them on the VM via the kernel.
+
+    transfer_path is the local blob to move (already gzipped if applicable);
+    staging_remote is where the assembled blob lands ("<remote>.gz" when
+    compressed, otherwise final_remote); expected_size is the size of the
+    original uncompressed file used for verification.
+    """
+    display_local = display_local or transfer_path
+    part_prefix = staging_remote + ".clabpart"
+    total = os.path.getsize(transfer_path)
+    nparts = (total + TRANSFER_PART_BYTES - 1) // TRANSFER_PART_BYTES
+
+    uploaded_parts = []
+    try:
+        with open(transfer_path, "rb") as src:
+            for i in range(nparts):
+                data = src.read(TRANSFER_PART_BYTES)
+                if not data:
+                    break
+                part_remote = f"{part_prefix}{i:05d}"
+                contents.upload_bytes(data, part_remote)
+                uploaded_parts.append(part_remote)
+
+        runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
+        stage = repr(staging_remote)
+        dirname = repr(os.path.dirname(staging_remote))
+        basename = repr(os.path.basename(staging_remote))
+        final = repr(final_remote)
+        code = (
+            "import gzip, os, shutil\n"
+            f"_d = os.path.dirname({stage}) or '.'\n"
+            f"_parts = sorted(p for p in os.listdir(_d) "
+            f"if p.startswith({basename} + '.clabpart'))\n"
+            f"with open({stage}, 'wb') as out:\n"
+            "    for _p in _parts:\n"
+            "        with open(os.path.join(_d, _p), 'rb') as inp:\n"
+            "            shutil.copyfileobj(inp, out)\n"
+        )
+        if staging_remote != final_remote:
+            code += (
+                f"with gzip.open({stage}, 'rb') as src, open({final}, 'wb') as dst:\n"
+                "    shutil.copyfileobj(src, dst)\n"
+            )
+        code += f"print('assembled', {final}, os.path.getsize({final}))\n"
+        try:
+            # Assembly of multi-GB blobs can exceed the default 10s quiet
+            # timeout, so give it an explicit generous budget.
+            runtime.execute_code(code, timeout=1800)
+        finally:
+            runtime.stop()
+
+        meta = contents.list_dir(final_remote)
+        remote_size = meta.get("size") if isinstance(meta, dict) else None
+        if remote_size is not None and int(remote_size) != expected_size:
+            raise RuntimeError(
+                f"Size mismatch after chunked assembly: "
+                f"expected {expected_size}, got {remote_size}"
+            )
+
+        if staging_remote != final_remote:
+            contents.rm(staging_remote)
+
+        state.history.log_event(
+            name,
+            "file_operation",
+            {
+                "op": "upload",
+                "local": display_local,
+                "remote": final_remote,
+                "chunked": True,
+                "parts": int(nparts),
+            },
+        )
+        typer.echo(
+            f"[colab] Uploaded '{display_local}' to '{final_remote}' "
+            f"in {nparts} chunks"
+        )
+    finally:
+        for part_remote in uploaded_parts:
+            try:
+                contents.rm(part_remote)
+            except Exception:
+                pass
 
 
 def upload(
@@ -163,8 +267,38 @@ def upload(
         typer.echo(f"[colab] Local file '{local_path}' not found.")
         raise typer.Exit(1)
     contents = ContentsClient(s)
+    tmp_gz = None
     try:
-        if not no_compress and os.path.getsize(local_path) > TRANSFER_COMPRESS_ABOVE_BYTES:
+        original_size = os.path.getsize(local_path)
+        use_gz = not no_compress and original_size > TRANSFER_COMPRESS_ABOVE_BYTES
+        if use_gz:
+            fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+            os.close(fd)
+            with open(local_path, "rb") as src, gzip.open(
+                tmp_gz, "wb", compresslevel=6
+            ) as dst:
+                shutil.copyfileobj(src, dst)
+            transfer_path = tmp_gz
+            staging_remote = remote_path + ".gz"
+        else:
+            transfer_path = local_path
+            staging_remote = remote_path
+
+        transfer_size = os.path.getsize(transfer_path)
+
+        if transfer_size > TRANSFER_PART_BYTES:
+            _upload_chunked(
+                state,
+                name,
+                s,
+                contents,
+                transfer_path,
+                staging_remote,
+                remote_path,
+                expected_size=original_size,
+                display_local=local_path,
+            )
+        elif use_gz:
             _upload_compressed(state, name, s, contents, local_path, remote_path)
         else:
             contents.upload(local_path, remote_path)
@@ -177,11 +311,12 @@ def upload(
     except Exception as e:
         typer.echo(f"[colab] Upload failed: {e}")
         raise typer.Exit(1)
+    finally:
+        if tmp_gz is not None and os.path.exists(tmp_gz):
+            os.remove(tmp_gz)
 
 
-def _download_compressed(state, name, s, contents, remote_path, local_path, expected_size):
-    gz_remote = remote_path + ".gz"
-
+def _compress_on_vm(s, remote_path, gz_remote):
     runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
     rp = repr(remote_path)
     gp = repr(gz_remote)
@@ -190,38 +325,68 @@ def _download_compressed(state, name, s, contents, remote_path, local_path, expe
             "import gzip, os, shutil\n"
             f"with open({rp}, 'rb') as src, gzip.open({gp}, 'wb', compresslevel=6) as dst:\n"
             "    shutil.copyfileobj(src, dst)\n"
-            f"print('compressed', {gp}, os.path.getsize({gp}))"
+            f"print('compressed', {gp}, os.path.getsize({gp}))",
+            timeout=1800,
         )
     finally:
         runtime.stop()
 
-    fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+
+def _download_chunked(state, name, s, contents, transfer_remote, dest_path, transfer_size):
+    """Fetch a payload above the per-request ceiling by splitting it into part
+    files on the VM via the kernel, downloading them one request at a time,
+    and reassembling locally into dest_path."""
+    part_prefix = transfer_remote + ".clabpart"
+    transfer_size = int(transfer_size)
+    nparts = (transfer_size + TRANSFER_PART_BYTES - 1) // TRANSFER_PART_BYTES
+
+    fd, tmp_part = tempfile.mkstemp(suffix=".part")
     os.close(fd)
     try:
-        contents.download(gz_remote, tmp_gz)
-        with gzip.open(tmp_gz, "rb") as src, open(local_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-
-        actual_size = os.path.getsize(local_path)
-        if actual_size != expected_size:
-            raise RuntimeError(
-                f"Size mismatch after decompression: expected {expected_size}, got {actual_size}"
+        runtime = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
+        src = repr(transfer_remote)
+        try:
+            # Splitting multi-GB blobs can exceed the default 10s quiet
+            # timeout, so give it an explicit generous budget.
+            runtime.execute_code(
+                "import os\n"
+                f"_src = {src}\n"
+                f"_n = {TRANSFER_PART_BYTES}\n"
+                "_i = 0\n"
+                "with open(_src, 'rb') as f:\n"
+                "    while True:\n"
+                "        _b = f.read(_n)\n"
+                "        if not _b:\n"
+                "            break\n"
+                "        with open(_src + '.clabpart%05d' % _i, 'wb') as p:\n"
+                "            p.write(_b)\n"
+                "        _i += 1\n"
+                "print('split', _i)\n",
+                timeout=1800,
             )
+        finally:
+            runtime.stop()
 
-        contents.rm(gz_remote)
+        with open(dest_path, "wb") as out:
+            for i in range(nparts):
+                contents.download(f"{part_prefix}{i:05d}", tmp_part)
+                with open(tmp_part, "rb") as pf:
+                    shutil.copyfileobj(pf, out)
 
-        state.history.log_event(
-            name,
-            "file_operation",
-            {"op": "download", "remote": remote_path, "local": local_path, "compressed": True},
-        )
-        typer.echo(
-            f"[colab] Downloaded '{remote_path}' to '{local_path}' "
-            "(gzip-compressed in transit)"
-        )
+        actual = os.path.getsize(dest_path)
+        if actual != transfer_size:
+            raise RuntimeError(
+                f"Size mismatch after chunked download: "
+                f"expected {transfer_size}, got {actual}"
+            )
     finally:
-        if os.path.exists(tmp_gz):
-            os.remove(tmp_gz)
+        if os.path.exists(tmp_part):
+            os.remove(tmp_part)
+        for i in range(nparts):
+            try:
+                contents.rm(f"{part_prefix}{i:05d}")
+            except Exception:
+                pass
 
 
 def download(
@@ -254,14 +419,73 @@ def download(
     try:
         meta = contents.list_dir(remote_path)
         remote_size = meta.get("size") if isinstance(meta, dict) else None
+
         if (
             not no_compress
             and remote_size is not None
             and int(remote_size) > TRANSFER_COMPRESS_ABOVE_BYTES
         ):
-            _download_compressed(
+            gz_remote = remote_path + ".gz"
+            _compress_on_vm(s, remote_path, gz_remote)
+
+            fd, tmp_gz = tempfile.mkstemp(suffix=".gz")
+            os.close(fd)
+            try:
+                gz_meta = contents.list_dir(gz_remote)
+                gz_size = gz_meta.get("size") if isinstance(gz_meta, dict) else None
+                chunked = False
+                if gz_size is not None and int(gz_size) > TRANSFER_PART_BYTES:
+                    _download_chunked(
+                        state, name, s, contents, gz_remote, tmp_gz, int(gz_size)
+                    )
+                    chunked = True
+                else:
+                    contents.download(gz_remote, tmp_gz)
+
+                with gzip.open(tmp_gz, "rb") as src, open(local_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+                actual_size = os.path.getsize(local_path)
+                if actual_size != int(remote_size):
+                    raise RuntimeError(
+                        f"Size mismatch after decompression: "
+                        f"expected {remote_size}, got {actual_size}"
+                    )
+
+                contents.rm(gz_remote)
+
+                event = {
+                    "op": "download",
+                    "remote": remote_path,
+                    "local": local_path,
+                    "compressed": True,
+                }
+                if chunked:
+                    event["chunked"] = True
+                state.history.log_event(name, "file_operation", event)
+                suffix = ", chunked" if chunked else ""
+                typer.echo(
+                    f"[colab] Downloaded '{remote_path}' to '{local_path}' "
+                    f"(gzip-compressed in transit{suffix})"
+                )
+            finally:
+                if os.path.exists(tmp_gz):
+                    os.remove(tmp_gz)
+        elif remote_size is not None and int(remote_size) > TRANSFER_PART_BYTES:
+            _download_chunked(
                 state, name, s, contents, remote_path, local_path, int(remote_size)
             )
+            state.history.log_event(
+                name,
+                "file_operation",
+                {
+                    "op": "download",
+                    "remote": remote_path,
+                    "local": local_path,
+                    "chunked": True,
+                },
+            )
+            typer.echo(f"[colab] Downloaded '{remote_path}' to '{local_path}' in chunks")
         else:
             contents.download(remote_path, local_path)
             state.history.log_event(

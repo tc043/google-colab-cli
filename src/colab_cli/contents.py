@@ -53,11 +53,8 @@ class ContentsClient:
     def list_dir(self, path: str):
         return self._request("GET", path)
 
-    def upload(self, local_path: str, remote_path: str):
-        with open(local_path, "rb") as f:
-            content = f.read()
-
-        b64_content = base64.b64encode(content).decode("ascii")
+    def upload_bytes(self, data: bytes, remote_path: str):
+        b64_content = base64.b64encode(data).decode("ascii")
         filename = remote_path.split("/")[-1]
 
         payload = {
@@ -71,7 +68,13 @@ class ContentsClient:
 
         return self._request("PUT", remote_path, json_data=payload)
 
-    def download(self, remote_path: str, local_path: str):
+    def upload(self, local_path: str, remote_path: str):
+        with open(local_path, "rb") as f:
+            content = f.read()
+
+        return self.upload_bytes(content, remote_path)
+
+    def download_bytes(self, remote_path: str) -> bytes:
         data = self._request("GET", remote_path, params={"content": "1"})
 
         if data.get("type") == "directory":
@@ -81,10 +84,13 @@ class ContentsClient:
         fmt = data.get("format")
 
         if fmt == "base64":
-            content_bytes = base64.b64decode(content)
-        else:
-            # Assume text if it's not base64 explicitly encoded
-            content_bytes = str(content).encode("utf-8")
+            return base64.b64decode(content)
+
+        # Assume text if it's not base64 explicitly encoded
+        return str(content).encode("utf-8")
+
+    def download(self, remote_path: str, local_path: str):
+        content_bytes = self.download_bytes(remote_path)
 
         with open(local_path, "wb") as f:
             f.write(content_bytes)
