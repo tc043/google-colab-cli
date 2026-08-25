@@ -47,26 +47,19 @@ colab run -s <session> examples/transfer/gcs_pull.py --bucket gs-bucket-name tel
 
 (`colab run` forwards args as sys.argv; `exec -f` uses the constants.)
 
-## Path B — Drive folder shared with the SA ($0, no billing)
+## Path B — Drive folder shared with the SA (NOT viable on personal accounts)
 
-1. Create a Drive folder, e.g. `colab-transfer`.
-2. Share it with the SA's email
-   (`colab-transfer@<PROJECT_ID>.iam.gserviceaccount.com`) as **Editor**.
-3. Copy the folder ID from its URL (`.../folders/<FOLDER_ID>`).
+**Verified dead end (2026-08):** service accounts have **zero Drive storage
+quota**, so every SA-created file fails with 403 `storageQuotaExceeded`
+("Service Accounts do not have storage quota"). Google's only sanctioned
+workarounds are Shared Drives (requires a paid Workspace account — unavailable
+on personal Gmail) or OAuth delegation (the interactive flow this setup exists
+to avoid). The drive_push/drive_pull scripts are kept for Workspace users who
+can put the SA on a Shared Drive; everyone else should use Path A.
 
-Files the SA uploads are owned by the SA but live in that shared folder, so you
-can see/download them in the Drive UI.
-
-VM side:
-
-```bash
-colab install -s <session> google-api-python-client
-# edit DRIVE_FOLDER_ID at top of drive_push.py / drive_pull.py once, then:
-colab exec -s <session> -f examples/transfer/drive_push.py    # constants mode
-colab run -s <session> examples/transfer/drive_pull.py big.bin
-```
-
-`drive_pull.py` with no file args lists accessible files instead.
+If you do have a Shared Drive: share it with the SA email as **Content
+manager**, set `DRIVE_FOLDER_ID` to the Shared Drive folder ID, and pass
+`supportsAllDrives=True` to list/create calls.
 
 ## Which one?
 
