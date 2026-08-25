@@ -102,8 +102,14 @@ def run_automation(
                 state.history.log_event(s.name, "drive_auth_needed", {"uri": uri})
                 sys.stdout.write("Press Enter after you have granted access... ")
                 sys.stdout.flush()
-                with open("/dev/tty") as tty:
-                    tty.readline()
+                try:
+                    # Prefer the controlling terminal so piped-stdin
+                    # automations still block for the human.
+                    with open("/dev/tty") as tty:
+                        tty.readline()
+                except OSError:
+                    # Windows has no /dev/tty; read the console via stdin.
+                    input()
 
             typer.echo("[colab] Authorizing VM...")
             params["dryrun"] = "false"
@@ -204,7 +210,11 @@ def drivemount(
     from colab_cli.common import state
 
     name = state.resolve_session(session)
-    code = f"from google.colab import drive\ndrive.mount('{path}')"
+    # timeout_ms also governs the kernel-side request_auth wait (default
+    # 120s): with granular consent screens users routinely exceed it, after
+    # which mount proceeds credential-less and fails. 480s keeps the whole
+    # ceremony inside the 600s execute() cap (pexpect adds +30s).
+    code = f"from google.colab import drive\ndrive.mount('{path}', timeout_ms=480000)"
     typer.echo(f"[colab] Mounting Google Drive to '{path}' on {name}...")
     run_automation(
         name,

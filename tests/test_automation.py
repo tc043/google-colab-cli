@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+import json
 import pytest
 from typer.testing import CliRunner
 from colab_cli.cli import app
@@ -96,7 +97,11 @@ def test_cli_drivemount(mock_state, mock_runtime_class, mock_session):
     mock_runtime.execute_code.assert_called_once()
     called_code = mock_runtime.execute_code.call_args[0][0]
 
-    assert "drive.mount('/foo/bar')" in called_code
+    assert "drive.mount('/foo/bar'" in called_code
+    # 480s kernel-side window: the default 120s request_auth timeout expires
+    # mid-consent (granular OAuth screens are slow), after which mount
+    # proceeds credential-less and fails.
+    assert "timeout_ms=480000" in called_code
     assert mock_runtime.colab_request_hook is not None
     # Drivemount waits for the user to OAuth in their browser; the kernel
     # goes silent during that wait and the default 10s execute() timeout
@@ -123,3 +128,63 @@ def test_cli_auth_uses_long_timeout(mock_state, mock_runtime_class, mock_session
 
     _, kwargs = mock_runtime.execute_code.call_args
     assert kwargs.get("timeout") is not None and kwargs["timeout"] >= 300
+
+
+class _FakeResp:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+@patch("colab_cli.commands.automation.input")
+@patch("colab_cli.commands.automation.open", side_effect=OSError("no /dev/tty"))
+@patch("colab_cli.commands.automation.get_credentials")
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drivefs_hook_reads_enter_without_dev_tty(
+    mock_state, mock_runtime_class, mock_get_creds, mock_open, mock_input,
+    mock_session,
+):
+    """Windows has no /dev/tty; the DriveFS auth hook must fall back to
+    stdin for the 'Press Enter' gate. Dying silently here left the kernel
+    waiting on request_auth until it timed out, then DriveFS launched
+    without credentials and mount failed."""
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+
+    creds = MagicMock()
+    creds.request.side_effect = [
+        _FakeResp(200, '\n{"token": "tok"}'),  # token fetch
+        _FakeResp(
+            200,
+            json.dumps(
+                {"success": False, "unauthorized_redirect_uri": "https://a.example/u"}
+            ),
+        ),  # dryrun=true: auth needed
+        _FakeResp(200, '{"success": true}'),  # dryrun=false after Enter
+    ]
+    mock_get_creds.return_value = creds
+    mock_runtime_class.return_value.execute_code.return_value = [{"text": "Mounted"}]
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+    assert result.exit_code == 0
+
+    hook = mock_runtime_class.return_value.colab_request_hook
+    assert hook is not None
+
+    wsclient = MagicMock()
+    wsclient.session.msg.return_value = {
+        "value": {"type": "colab_reply", "colab_msg_id": "mid-1"}
+    }
+    msg = {
+        "content": {"request": {"authType": "dfs_ephemeral"}},
+        "metadata": {"colab_msg_id": "mid-1"},
+        "header": {"msg_id": "h1"},
+    }
+    assert hook(msg, wsclient) is True
+
+    # The stdin fallback (not /dev/tty) consumed the Enter press.
+    mock_input.assert_called_once()
+    sent = wsclient.stdin_channel.send.call_args[0][0]
+    assert sent["value"]["colab_msg_id"] == "mid-1"
+    assert sent["parent_header"] == {"msg_id": "h1"}
