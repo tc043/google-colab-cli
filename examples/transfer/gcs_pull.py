@@ -3,7 +3,7 @@ import os
 import sys
 
 SA_KEY_PATH = "/content/sa-key.json"
-BUCKET = ""
+BUCKET = "colab-transfer-tc043"
 REMOTE_PREFIX = ""
 DEST_DIR = "/content"
 
@@ -54,9 +54,7 @@ def main():
 
 
 def _pull(bucket, remote, dest):
-    from google.cloud.storage import Blob
-
-    blob = Blob(bucket, remote)
+    blob = bucket.blob(remote)
     if not blob.exists():
         sys.exit(f"gs://{bucket.name}/{remote} does not exist")
     local = os.path.join(dest, os.path.basename(remote))

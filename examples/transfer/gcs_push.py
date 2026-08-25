@@ -3,7 +3,7 @@ import os
 import sys
 
 SA_KEY_PATH = "/content/sa-key.json"
-BUCKET = ""
+BUCKET = "colab-transfer-tc043"
 REMOTE_PREFIX = ""
 
 
@@ -48,10 +48,8 @@ def main():
 
 
 def _push(bucket, prefix, local_path):
-    from google.cloud.storage import Blob
-
     remote = f"{prefix}/{local_path.replace(os.sep, '/').lstrip('/')}" if prefix else local_path.replace(os.sep, "/").lstrip("/")
-    blob = Blob(bucket, remote)
+    blob = bucket.blob(remote)
     h = hashlib.sha256()
     size = 0
     with open(local_path, "rb") as f:
