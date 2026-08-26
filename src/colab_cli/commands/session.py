@@ -489,6 +489,7 @@ def keep_alive(
 
     reason = "time_limit_reached"
     extra: Dict[str, Any] = {}
+    kernel_ping_every = 5  # ~every 5 minutes
     while time.time() - start_time < max_duration:
         iterations += 1
         # Check if session still exists in local state
@@ -534,6 +535,56 @@ def keep_alive(
             else:
                 # For other errors (network), we retry and don't count as 4xx
                 pass
+
+        # Kernel-level keep-alive: the HTTP assignment ping alone does not
+        # reliably reset Colab's reaper for headless sessions (observed prunes
+        # minutes after activity while pings succeeded). Executing a trivial
+        # cell registers as genuine kernel activity.
+        if iterations % kernel_ping_every == 0:
+            try:
+                from colab_cli.runtime import ColabRuntime
+                from colab_cli.utils import is_terminal_error
+
+                rt = ColabRuntime(
+                    s.url,
+                    s.token,
+                    kernel_id=s.kernel_id,
+                    session_id=s.session_id,
+                )
+                rt.execute_code("print('colab-cli keepalive')", timeout=20)
+                if rt.kernel_id != s.kernel_id or rt.session_id != s.session_id:
+                    s.kernel_id = rt.kernel_id
+                    s.session_id = rt.session_id
+                    state.store.add(s)
+                state.history.log_event(
+                    session_name,
+                    "keep_alive_kernel_ping",
+                    {"iteration": iterations},
+                )
+            except Exception as ke:
+                from colab_cli.utils import is_terminal_error
+
+                terminal = False
+                try:
+                    terminal = is_terminal_error(ke)
+                except Exception:
+                    terminal = False
+                state.history.log_event(
+                    session_name,
+                    "keep_alive_error",
+                    {
+                        "iteration": iterations,
+                        "kind": "kernel_ping",
+                        "terminal": terminal,
+                        "error_type": type(ke).__name__,
+                        "error": str(ke)[:500],
+                    },
+                )
+                if terminal:
+                    consecutive_4xx += 1
+                    if consecutive_4xx >= 2:
+                        reason = "consecutive_4xx_errors"
+                        break
 
         time.sleep(60)
 
