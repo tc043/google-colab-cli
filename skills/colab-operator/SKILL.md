@@ -225,6 +225,29 @@ The keep-alive implementation uses the Colab Tunnel Frontend assignment ping on 
 
 Keep-alive is not persistence. Remote state can still disappear because of Colab policy, runtime limits, account limits, backend resets, or other service-side conditions. Important work must be checkpointed to durable storage.
 
+## Durable checkpointing
+
+Treat `/content` and in-memory kernel state as ephemeral. A healthy keep-alive process reduces idle pruning but cannot guarantee that Colab will preserve the VM.
+
+For work that would be costly to repeat, checkpoint at meaningful milestones and before risky operations such as dependency upgrades, kernel restarts, long unattended waits, or major pipeline stages.
+
+Prefer durable outputs over reconstructing state from a live notebook kernel:
+
+- Keep source code and configuration in the local project or version control; do not make the Colab VM the only copy.
+- Write resumable artifacts on the VM, such as model checkpoints, intermediate Parquet files, manifests, progress JSON, seeds, and completed-partition markers.
+- After important milestones, copy irreplaceable remote artifacts back to the local project with `colab download`, or sync them from the remote program to an explicitly configured durable store such as Google Drive, GCS, Hugging Face, or another user-approved destination.
+- For long training or data-processing jobs, design the script to resume from its latest checkpoint instead of assuming one uninterrupted Colab lifetime.
+- Record enough metadata to reproduce or resume the job: input/version identifiers, parameters, random seed, completed ranges/partitions, checkpoint path, and the last successful stage.
+
+Example local checkpoint retrieval:
+
+```powershell
+colab download -s agent /content/checkpoints/latest.pt .\checkpoints\latest.pt
+colab download -s agent /content/progress.json .\checkpoints\progress.json
+```
+
+Do not stop or restart a session containing uncheckpointed work unless recovery has failed or the user explicitly accepts losing that state.
+
 ## Parallel agents
 
 Avoid having unrelated agents mutate the same session-state file and session name.
@@ -267,6 +290,8 @@ When this skill is active, follow these defaults:
 - Reuse a healthy named runtime instead of creating duplicates.
 - Treat timeouts as a diagnostic event, not proof that the runtime is gone.
 - Let the CLI's token/session recovery try to preserve the same assignment.
+- Checkpoint costly or irreplaceable work to durable storage at meaningful milestones; never treat `/content` or kernel memory as the only copy.
+- Make long jobs resumable from their latest checkpoint whenever practical.
 - Never use interactive `repl`, `console`, `auth`, or `drivemount` from a non-interactive agent unless input is intentionally piped and supported.
 - Never terminate an unknown `[?]` assignment.
 - Always stop allocations the agent owns when finished.
