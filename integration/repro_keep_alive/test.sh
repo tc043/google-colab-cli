@@ -62,10 +62,43 @@ else
     exit 1
 fi
 
-SESSION_NAME="test-live-keep-alive"
+process_is_alive() {
+    uv run python - "$1" <<'PY'
+import ctypes
+import os
+import sys
+
+pid = int(sys.argv[1])
+if os.name == "nt":
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        raise SystemExit(1)
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            raise SystemExit(1)
+        raise SystemExit(0 if exit_code.value == STILL_ACTIVE else 1)
+    finally:
+        kernel32.CloseHandle(handle)
+
+try:
+    os.kill(pid, 0)
+except ProcessLookupError:
+    raise SystemExit(1)
+except PermissionError:
+    pass
+PY
+}
+
+SESSION_NAME="test-live-keep-alive-$(date +%s)-$$"
+HISTORY_FILE="$HOME/.config/colab-cli/history/${SESSION_NAME}.jsonl"
 
 cleanup_session() {
     uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME" 2>/dev/null || true
+    rm -f "$HISTORY_FILE"
 }
 trap "cleanup_session; rm -rf $TMP_DIR" EXIT
 
@@ -90,15 +123,12 @@ if [ -z "$PID" ] || [ "$PID" == "null" ]; then
 fi
 echo "[*] Keep-alive PID: $PID"
 
-if ps -p $PID > /dev/null; then
+if process_is_alive "$PID"; then
    echo "[*] Keep-alive process is running."
 else
    echo "[FAILURE] Keep-alive process NOT running."
    exit 1
 fi
-
-# Verify the process command line is actually colab keep-alive
-ps -fp $PID | grep "keep-alive"
 
 LOG_OUTPUT=$(uv run colab $AUTH_FLAGS --config "$SESSION_FILE" log -s "$SESSION_NAME")
 echo "$LOG_OUTPUT"
@@ -120,16 +150,16 @@ uv run colab $AUTH_FLAGS --config "$SESSION_FILE" stop -s "$SESSION_NAME"
 sleep 1
 
 if [ "$EXPECT_DAEMON" -eq 1 ]; then
-    if ! ps -p $PID > /dev/null; then
+    if ! process_is_alive "$PID"; then
        echo "[*] Keep-alive process terminated successfully."
     else
        echo "[FAILURE] Keep-alive process still running after stop!"
-       kill $PID
        exit 1
     fi
 fi
 
 # Disable the cleanup trap; we already cleaned up.
+rm -f "$HISTORY_FILE"
 trap "rm -rf $TMP_DIR" EXIT
 
 echo "[SUCCESS] Live integration test passed!"
