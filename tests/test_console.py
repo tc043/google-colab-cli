@@ -167,6 +167,38 @@ def _connect_as_tty(*args, **kwargs):
         connect_console(*args, **kwargs)
 
 
+def test_console_tty_without_termios_still_reconnects(mock_session):
+    """Windows TTYs must keep reconnect semantics even without POSIX raw mode."""
+    first = _websocket_attempt(
+        error=websocket.WebSocketConnectionClosedException("proxy link lost"),
+        close_code=1006,
+    )
+    second = _websocket_attempt(close_code=1000, close_reason="shell exited")
+    attempts = iter([first, second])
+
+    def make_ws(**kwargs):
+        ws = next(attempts)
+        ws._on_open = kwargs["on_open"]
+        ws._on_error = kwargs["on_error"]
+        ws._on_close = kwargs["on_close"]
+        return ws
+
+    with (
+        patch("colab_cli.console._HAS_TERMIOS", False),
+        patch("colab_cli.console.sys.stdin.isatty", return_value=True),
+        patch("colab_cli.console.websocket.WebSocketApp", side_effect=make_ws) as ws_app,
+        patch.object(_ConsoleInputForwarder, "start"),
+    ):
+        connect_console(
+            mock_session,
+            refresh_session=lambda current: current,
+            retry_delays=(0,),
+            _max_reconnect_attempts=1,
+        )
+
+    assert ws_app.call_count == 2
+
+
 @patch("colab_cli.console.threading.Thread")
 @patch("colab_cli.console.websocket.WebSocketApp")
 @patch("colab_cli.console.sys.stdin.isatty", return_value=True)

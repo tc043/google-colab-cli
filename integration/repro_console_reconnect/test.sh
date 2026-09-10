@@ -122,9 +122,11 @@ fi
 echo "[*] Injecting one transient refresh failure on CPU endpoint $TEST_ENDPOINT..."
 timeout 120 uv run python - "$AUTH_PROVIDER" "$SESSION_FILE" "$SESSION_NAME" >"$OUTPUT_FILE" 2>&1 <<'PY'
 import os
-import pty
 import sys
 import threading
+
+if os.name != "nt":
+    import pty
 
 import colab_cli.console as console
 from colab_cli.auth import AuthProvider
@@ -169,18 +171,41 @@ def websocket_app(**kwargs):
     return real_websocket_app(**kwargs)
 
 
-master_fd, slave_fd = pty.openpty()
+if os.name == "nt":
+    read_fd, input_fd = os.pipe()
+    base_stdin = os.fdopen(read_fd, encoding="utf-8", buffering=1)
+
+    class TestTTY:
+        encoding = "utf-8"
+        errors = "strict"
+
+        def fileno(self):
+            return base_stdin.fileno()
+
+        def isatty(self):
+            return True
+
+        def read(self, *args, **kwargs):
+            return base_stdin.read(*args, **kwargs)
+
+        def close(self):
+            base_stdin.close()
+
+    stdin_stream = TestTTY()
+else:
+    input_fd, slave_fd = pty.openpty()
+    stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
+
 original_stdin = sys.stdin
-stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
 sys.stdin = stdin_stream
 console.websocket.WebSocketApp = websocket_app
 
 
 def drive_reconnected_shell():
     if not second_open.wait(90):
-        os.write(master_fd, b"\x03")
+        os.write(input_fd, b"\x03")
         return
-    os.write(master_fd, b"printf 'COLAB_CONSOLE_RECONNECT_OK\\n'\nexit\n")
+    os.write(input_fd, b"printf 'COLAB_CONSOLE_RECONNECT_OK\\n'\nexit\n")
 
 
 def refresh_session(expected):
@@ -205,7 +230,7 @@ finally:
     console.websocket.WebSocketApp = real_websocket_app
     sys.stdin = original_stdin
     stdin_stream.close()
-    os.close(master_fd)
+    os.close(input_fd)
 
 if not forced_disconnect.is_set():
     raise SystemExit("Fault injection did not run")
@@ -228,10 +253,12 @@ echo "[*] Simulating a completed concurrent stop in an isolated binding copy..."
 cp "$SESSION_FILE" "$STOP_SESSION_FILE"
 timeout 60 uv run python - "$AUTH_PROVIDER" "$STOP_SESSION_FILE" "$SESSION_NAME" >"$STOP_OUTPUT_FILE" 2>&1 <<'PY'
 import os
-import pty
 import subprocess
 import sys
 import threading
+
+if os.name != "nt":
+    import pty
 
 import colab_cli.console as console
 from colab_cli.auth import AuthProvider
@@ -291,9 +318,32 @@ def refresh_session(expected):
     return _refresh_console_session(state, session_name, expected)
 
 
-master_fd, slave_fd = pty.openpty()
+if os.name == "nt":
+    read_fd, input_fd = os.pipe()
+    base_stdin = os.fdopen(read_fd, encoding="utf-8", buffering=1)
+
+    class TestTTY:
+        encoding = "utf-8"
+        errors = "strict"
+
+        def fileno(self):
+            return base_stdin.fileno()
+
+        def isatty(self):
+            return True
+
+        def read(self, *args, **kwargs):
+            return base_stdin.read(*args, **kwargs)
+
+        def close(self):
+            base_stdin.close()
+
+    stdin_stream = TestTTY()
+else:
+    input_fd, slave_fd = pty.openpty()
+    stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
+
 original_stdin = sys.stdin
-stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
 sys.stdin = stdin_stream
 console.websocket.WebSocketApp = websocket_app
 try:
@@ -307,7 +357,7 @@ finally:
     console.websocket.WebSocketApp = real_websocket_app
     sys.stdin = original_stdin
     stdin_stream.close()
-    os.close(master_fd)
+    os.close(input_fd)
 
 if not binding_removed.is_set():
     raise SystemExit("Concurrent binding removal did not run")

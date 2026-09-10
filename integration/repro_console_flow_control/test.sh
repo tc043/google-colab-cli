@@ -112,9 +112,11 @@ echo "[*] Streaming beyond the PTY pause threshold on $TEST_ENDPOINT..."
 timeout 120 uv run python - "$AUTH_PROVIDER" "$SESSION_FILE" "$SESSION_NAME" >"$OUTPUT_FILE" 2>&1 <<'PY'
 import json
 import os
-import pty
 import sys
 import threading
+
+if os.name != "nt":
+    import pty
 
 import colab_cli.console as console
 from colab_cli.auth import AuthProvider
@@ -179,9 +181,32 @@ def websocket_app(**kwargs):
     return real_websocket_app(**kwargs)
 
 
-master_fd, slave_fd = pty.openpty()
+if os.name == "nt":
+    read_fd, input_fd = os.pipe()
+    base_stdin = os.fdopen(read_fd, encoding="utf-8", buffering=1)
+
+    class TestTTY:
+        encoding = "utf-8"
+        errors = "strict"
+
+        def fileno(self):
+            return base_stdin.fileno()
+
+        def isatty(self):
+            return True
+
+        def read(self, *args, **kwargs):
+            return base_stdin.read(*args, **kwargs)
+
+        def close(self):
+            base_stdin.close()
+
+    stdin_stream = TestTTY()
+else:
+    input_fd, slave_fd = pty.openpty()
+    stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
+
 original_stdin = sys.stdin
-stdin_stream = os.fdopen(slave_fd, encoding="utf-8", buffering=1)
 sys.stdin = stdin_stream
 console.websocket.WebSocketApp = websocket_app
 console._ConsoleInputForwarder = ObservedForwarder
@@ -189,7 +214,7 @@ console._ConsoleInputForwarder = ObservedForwarder
 
 def drive_shell():
     if not opened.wait(60):
-        os.write(master_fd, b"\x03")
+        os.write(input_fd, b"\x03")
         return
     command = (
         b"python3 -c \"import sys,time; "
@@ -197,9 +222,9 @@ def drive_shell():
         b"time.sleep(0.02)) for _ in range(800)]; "
         b"print('CONSOLE_FLOW_' + 'CONTROL_OK')\"\n"
     )
-    os.write(master_fd, command)
+    os.write(input_fd, command)
     if not sentinel_received.wait(90):
-        os.write(master_fd, b"\x03")
+        os.write(input_fd, b"\x03")
         return
     if active_forwarder is not None:
         active_forwarder.user_requested_close = True
@@ -222,7 +247,7 @@ finally:
     console._ConsoleInputForwarder = real_forwarder
     sys.stdin = original_stdin
     stdin_stream.close()
-    os.close(master_fd)
+    os.close(input_fd)
 
 if ack_requests < 6:
     raise SystemExit(f"Expected at least 6 PTY ACK requests, got {ack_requests}")

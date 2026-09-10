@@ -117,7 +117,7 @@ def on_open(ws):
     send_terminal_size(ws)
 
     def read_stdin():
-        is_tty = sys.stdin.isatty() and _HAS_TERMIOS
+        is_tty = sys.stdin.isatty()
         while _is_running:
             try:
                 char = sys.stdin.read(1)
@@ -455,12 +455,13 @@ def connect_console(
     when the control plane confirms it is gone, or raise when the lookup is
     inconclusive.
     """
-    is_tty = sys.stdin.isatty() and _HAS_TERMIOS
-    fd = sys.stdin.fileno() if is_tty else None
-    old_settings = termios.tcgetattr(fd) if is_tty else None
+    is_tty = sys.stdin.isatty()
+    raw_tty = is_tty and _HAS_TERMIOS
+    fd = sys.stdin.fileno() if raw_tty else None
+    old_settings = termios.tcgetattr(fd) if raw_tty else None
     sigwinch = getattr(signal, "SIGWINCH", None)
     old_sigwinch = (
-        signal.getsignal(sigwinch) if is_tty and sigwinch is not None else None
+        signal.getsignal(sigwinch) if raw_tty and sigwinch is not None else None
     )
     forwarder = _ConsoleInputForwarder(is_tty)
     current = session
@@ -477,7 +478,7 @@ def connect_console(
             send_terminal_size(ws)
 
     try:
-        if is_tty:
+        if raw_tty:
             tty.setraw(fd, termios.TCSANOW)
             if sigwinch is not None:
                 signal.signal(sigwinch, handle_sigwinch)
@@ -648,7 +649,7 @@ def connect_console(
         forwarder.stop()
         forwarder.close_active()
         forwarder.join(timeout=0.2)
-        if is_tty:
+        if raw_tty:
             termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             if sigwinch is not None:
                 signal.signal(sigwinch, old_sigwinch)
