@@ -1,89 +1,282 @@
 ---
 name: colab-operator
-description: Operate Google Colab environments via the `colab` CLI. Use when asked to create or manage GPU/TPU sessions, run Python/shell on a remote Colab VM, sync files, automate environment setup (packages, auth, Drive), or export session history.
+description: Operate Google Colab from coding agents through the `colab` CLI, especially on Windows/PowerShell. Use for persistent CPU/GPU/TPU sessions, one-shot remote jobs, repeated `exec` workflows, file transfer, session recovery, keep-alive, and safe cleanup.
 ---
 
-# Skill: Colab Session Operator
+# Colab Operator
 
-Operate Google Colab environments via the `colab` CLI: provision GPU/TPU sessions, run Python/shell on the VM, sync files, and capture work as notebooks.
+Use Google Colab as remote compute from an automated coding agent without opening the notebook UI.
 
-## Installation
+This skill assumes the `colab` executable is the CLI from this repository. On Windows, prefer PowerShell-compatible commands and non-interactive CLI paths.
 
-If the user does not already have the `colab` tool installed, it can be acquired
-by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
+## First: verify the executable
 
-## When to activate
-- Creating or managing TPU/GPU sessions.
-- Running Python or shell on a remote Colab VM.
-- Syncing files between local and remote.
-- Automating environment setup (packages, auth, Drive).
-- Exporting session history as a Jupyter notebook.
+Before allocating anything, verify what the agent will actually run:
 
-## Mental model (read this first)
-- **A session == a live Jupyter kernel on a rented VM.** `colab new` allocates a billable VM; `colab stop` releases it. Nothing reclaims it automatically except a 24h keep-alive cap, so an unstopped session burns compute units indefinitely.
-- **Kernel state PERSISTS across `colab exec` / `colab repl` calls in the same session.** Each invocation reattaches to the *same* kernel (the kernel ID is cached in local state) and only closes the websocket on exit — it does **not** shut the kernel down. So imports, variables, and defined functions survive between separate `colab exec` commands. Build up state incrementally; don't re-import everything each call. (`colab stop` and `colab restart-kernel` are what actually reset it.)
-- **Default working directory is `/content`.** Every `exec`/`repl`/`run` `cd`s there first; prefer absolute paths (`/content/...`) for file work. For `colab ls/rm/upload/download`, absolute `/content/...` paths work and the default `ls` path is `content` (VM root).
-- **`colab` is fire-and-forget.** Each command authenticates, does one thing, and exits. A detached background daemon (spawned by `colab new`) handles keep-alive; you don't manage it.
+```powershell
+Get-Command colab
+colab version
+colab sessions
+```
 
-## Authentication (the #1 thing that blocks agents)
-- The global flag is `--auth={adc,oauth2}` and the **default is `adc`** (Application Default Credentials). It must come *before* the subcommand: `colab --auth=adc new -s x`.
-- **ADC setup** (most reliable for headless/agent use). The Colab backends need a specific scope set, so re-mint ADC with all four scopes:
-  ```bash
-  gcloud auth application-default login \
-    --scopes=openid,\
-  https://www.googleapis.com/auth/cloud-platform,\
-  https://www.googleapis.com/auth/userinfo.email,\
-  https://www.googleapis.com/auth/colaboratory
-  ```
-  Why all four: `userinfo.email` (session backend `colab.research.google.com`, else 401), `colaboratory` (RuntimeService `colab.pa.googleapis.com` keep-alive, else 403), `openid`+`cloud-platform` (mandated by gcloud itself; it rejects scope lists missing `cloud-platform`).
-- **oauth2 setup**: `colab --auth=oauth2 <anything>` triggers a browser consent flow on first use (token cached at `~/.config/colab-cli/token.json`). Requires a client config at `~/.colab-cli-oauth-config.json` (or `-c PATH`). The browser step means it usually needs a human; prefer ADC for agents.
-- **Verify auth in one shot**: `colab sessions` (read-only, lists server assignments) or `colab whoami` (hidden debug command: prints the active email, scopes, audience, and expiry). When any call 403s against `colab.pa.googleapis.com`, the cause is almost always a missing scope — `colab whoami` shows it instantly.
-- **`colab new` pre-flights the keep-alive RPC** right after allocating. If your token lacks the `colaboratory` scope it unassigns the fresh VM (so you don't leak a billable assignment) and prints the exact remediation. Follow that message rather than retrying blindly.
-- **Do NOT confuse `colab auth` with CLI authentication.** `colab auth` injects *VM-side* GCP credentials into the running kernel (so notebook code can call BigQuery/GCS); it is orthogonal to how the CLI itself authenticates. Never suggest "run `colab auth`" to fix a CLI 401/403 — that's a scope/identity problem fixed via the `gcloud` command above.
+On the Windows fork, `Get-Command colab` should normally resolve to something like:
 
-## Workflow
+```text
+C:\Users\<user>\.local\bin\colab.exe
+```
 
-### Provision
-- `colab new -s <name>` (CPU). Add `--gpu A100` or `--tpu v6e1` for accelerators. **Always pass `-s <name>`** — an omitted name is auto-generated as a random 6-hex string, which makes later commands ambiguous.
-- Supported `--gpu`: `T4`, `L4`, `G4`, `H100`, `A100`. Supported `--tpu`: `v5e1`, `v6e1`.
-- **Gotcha**: an unrecognized `--gpu` value silently falls back to **A100** (which then usually fails the next step). A `400` on `colab new` with an accelerator means no quota/entitlement for it on this account — fall back to `--gpu T4` or omit the flag for CPU.
-- Accelerator availability is tier-gated; most accounts can only get CPU. Don't assume a GPU/TPU will allocate.
+If working from a checkout of this fork and the installed tool is missing or stale, install the current checkout rather than PyPI:
 
-### Execute
-- **Preferred**: `colab exec -s <name> -f <script.py>` runs a local script on the remote VM (read locally, sent to the kernel — no manual upload needed).
-- **Piped code**: `echo "print(1)" | colab exec -s <name>` or `cat script.py | colab exec -s <name>`.
-- **Notebooks**: `colab exec -s <name> -f nb.ipynb` runs each code cell and writes results to `<basename>_output.ipynb` next to the input. A `# @title Foo` first line labels the cell in progress output.
-- **Plots/images**: PNG/JPEG outputs are intercepted. Use `--output-image <path>` on `exec`/`repl` to save to a known location (otherwise a temp path is printed). Inline terminal-image escapes are auto-suppressed when stdout isn't a TTY, so piped/captured output stays clean.
-- **Shell**: `echo "cmd" | colab console -s <name>` for batch shell. Console wraps bash in tmux, so even piped output contains terminal-control bytes — filter with `grep -a` for a specific line. `exec` is faster when you don't need a real shell.
-- **Never run `colab repl`, `colab console`, `colab auth`, or `colab drivemount` interactively from an agent** — they expect a TTY and will hang. `repl`/`console` accept piped stdin and exit on EOF; `auth`/`drivemount` genuinely require a human at the terminal.
+```powershell
+cd C:\path\to\google-colab-cli
+uv tool install --reinstall --force .
+colab version
+```
 
-### Ephemeral one-shot jobs (`colab run`)
-- `colab run [--gpu T4] [--tpu v6e1] [--keep] [-s NAME] script.py [args...]` = `new` + `exec` + `stop` in one command. It provisions a fresh VM, runs the script with `sys.argv` and `__name__ == "__main__"` set like native `python script.py args`, then tears the VM down (unless `--keep`).
-- **Exit codes propagate**: an uncaught exception or `sys.exit(N)` in the script makes `colab run` exit non-zero (CPython semantics: `sys.exit()`/`sys.exit(0)` → 0, `sys.exit(N)` → N, `sys.exit("msg")` → 1).
-- **Stream separation**: `colab run` writes its own `[colab] ...` chatter to **stderr** and the script's output to **stdout** — so `colab run job.py > out.txt` captures only the script's stdout. (`colab exec` streams the script's stdout/stderr live to your stdout/stderr.)
-- Works as a shebang: `#!/usr/bin/env -S colab run --gpu T4` makes a `chmod +x`'d `.py` a self-contained "rent a GPU, run, clean up" script. After editing CLI behavior, reinstall before testing shebangs — they resolve `colab` via `$PATH`, not the editable install.
-- A nonexistent script path exits non-zero **before** allocating a VM (no wasted compute).
+After pulling or changing the CLI source, repeat that install command before testing through `PATH`. A running agent/terminal may need to be restarted to pick up a newly-added PATH entry.
 
-### Automate
-- `colab auth -s <name>` — VM-side GCP creds, needed before in-VM GCS/BigQuery calls (interactive; not agent-runnable).
-- `colab drivemount -s <name> [PATH]` — mounts Drive at `/content/drive` by default (interactive; not agent-runnable).
-- `colab install -s <name> pkg1 pkg2` — installs via `uv pip install --system`, falling back to `pip`. Also `colab install -s <name> -r requirements.txt`.
+The package exposes:
 
-### Inspect & report
-- `colab help` (or `colab help <cmd>`) lists/explains commands; the listing is alphabetical.
-- `colab sessions` lists server-side assignments and auto-prunes stale local entries. Orphans with no local record show as `[?]`.
-- `colab status [-s <name>]` shows hardware, IDLE/BUSY, and last execution.
-- `colab log -s <name> [-n 20] [-t TYPE]` shows recent structured events; invaluable when a task fails (keep-alive errors carry the raw `response_body`).
-- `colab log -s <name> -o summary.ipynb` exports the session as a notebook (also `.md`, `.txt`, `.jsonl` by suffix).
-- `colab url -s <name>` prints a browser URL that attaches the Colab web UI to your existing CLI session instead of allocating a new VM (add `--open` to launch it).
-- `colab skill` / `colab readme` print this skill and the README (handy for self-discovery).
+```text
+colab = colab_cli.cli:main
+```
 
-## Safety
-- **Always `colab stop -s <name>` when done** — idle VMs burn compute units. `colab run` (without `--keep`) self-cleans even if the script errors.
-- Local state lives in `~/.config/colab-cli/sessions.json` (settings in `settings.json`, history in `history/*.jsonl`). Don't edit by hand.
-- **Isolate parallel/agent runs** with the global `--config <path>` flag to point session state at a scratch file (e.g. `colab --config /tmp/agent.json new -s job`). The keep-alive daemon inherits `--auth` and `--config` automatically.
+## Authentication
 
-## Recovery
-- "Session not found" / 404 / 401 on exec: the backend pruned the VM. `colab exec`/`repl` detect this and clean up local state automatically — run `colab sessions` and re-create with `colab new`.
-- Execution timeout or wedged kernel: `colab restart-kernel -s <name>` (keeps the VM, resets the kernel), or `colab stop` then `colab new`.
-- Keep-alive daemon died (`colab log` shows `keep_alive_stopped reason=consecutive_4xx_errors`): almost always the missing `colaboratory` scope — re-auth per the Authentication section.
+The default CLI authentication provider is `oauth2`.
+
+A previously completed browser authorization is cached under the user's Colab CLI config, so agents can normally reuse it non-interactively afterward.
+
+Read-only verification:
+
+```powershell
+colab sessions
+```
+
+If the OAuth browser flow is required for the first time, a human must complete it. Do not make an autonomous agent repeatedly retry an interactive auth prompt.
+
+`colab auth` is different: it injects credentials *inside* the remote VM for code that needs GCP access. It does not fix CLI login problems.
+
+## Choose the execution model
+
+### Persistent session: default for multi-step agent work
+
+Use one named session when the agent will run many commands, iterate on code, install packages, or preserve Python state:
+
+```powershell
+colab new -s agent
+colab exec -s agent -f .\script.py --timeout 300
+colab status -s agent
+```
+
+A session preserves the remote Jupyter kernel across `exec` calls. Variables, imports, installed packages, and files on the VM remain available until the kernel/session is stopped or replaced.
+
+Prefer a descriptive unique name such as `opencode-quant`, `codex-etl`, or `agent-cv` instead of creating random unnamed sessions.
+
+### One-shot job: use `colab run`
+
+For an isolated script that should allocate, execute, and release automatically:
+
+```powershell
+colab run .\job.py
+```
+
+GPU example:
+
+```powershell
+colab run --gpu T4 .\train.py --epochs 10 --batch-size 32
+```
+
+Keep the created session only when continued work is intentional:
+
+```powershell
+colab run --gpu T4 --keep -s training-agent .\train.py
+```
+
+Without `--keep`, `run` should clean up the allocation even when the script fails.
+
+## Agent operating loop
+
+For multi-step work, follow this loop:
+
+1. Run `colab sessions` before allocating anything.
+2. Reuse the requested named session if it is already active.
+3. Otherwise create exactly one session with `colab new -s <name>`.
+4. Use `colab exec -s <name> -f <local.py>` for normal Python work.
+5. Inspect with `colab status -s <name>` and `colab log -s <name>` when something behaves unexpectedly.
+6. Stop only the session the agent owns when the task is truly finished.
+
+Never create a replacement runtime merely because one `exec` command times out. First inspect the existing session and retry/recover it.
+
+## Session and runtime recovery
+
+This fork includes runtime-proxy token refresh and console/session recovery from upstream PR #109 plus Windows-specific fixes.
+
+For normal `exec`, file operations, and startup paths, expired runtime-proxy credentials can be refreshed against the same Colab assignment. The CLI should not require a new VM merely because a runtime token expired.
+
+If a command fails:
+
+```powershell
+colab sessions
+colab status -s agent
+colab log -s agent -n 30
+```
+
+Then retry the same operation once if the session still exists.
+
+If the kernel is wedged but the VM is still active:
+
+```powershell
+colab restart-kernel -s agent
+```
+
+Only stop/recreate the VM after confirming the existing assignment is unusable.
+
+Do not implement recovery by blindly doing `colab new` after every timeout; that can lose remote state and leak compute allocations.
+
+## Windows console behavior
+
+Windows does not provide POSIX `termios`, so this fork keeps Windows TTY operation separate from POSIX raw-terminal setup while preserving interactive reconnect semantics.
+
+Automated agents should still avoid unpiped interactive modes:
+
+```text
+colab repl
+colab console
+colab auth
+colab drivemount
+```
+
+Those can require real terminal/user interaction.
+
+For shell-like batch work, piped console input is allowed:
+
+```powershell
+"pwd`nls -la`nexit" | colab console -s agent
+```
+
+However, prefer `colab exec` for agents whenever Python can perform the task; it is easier to capture, time out, and recover safely.
+
+## Execution
+
+Run a local Python file remotely:
+
+```powershell
+colab exec -s agent -f .\analysis.py --timeout 300
+```
+
+Pass environment variables:
+
+```powershell
+colab exec -s agent -f .\job.py --env MODE=test --env LIMIT=100
+```
+
+The remote working directory is normally `/content`.
+
+For long jobs, set an explicit timeout suitable for the task. A local timeout does not automatically prove that the VM disappeared; inspect the session before recreating it.
+
+## Accelerators
+
+CPU:
+
+```powershell
+colab new -s agent
+```
+
+GPU:
+
+```powershell
+colab new -s agent --gpu T4
+```
+
+Supported GPU variants currently exposed by this branch are `T4`, `L4`, `G4`, `H100`, and `A100`.
+
+TPU:
+
+```powershell
+colab new -s agent --tpu v6e1
+```
+
+Supported TPU variants are `v5e1` and `v6e1`.
+
+Accelerator availability depends on the user's Colab entitlement and current capacity. Do not spin repeatedly through expensive accelerator requests after quota/capacity failures.
+
+## Files and environment
+
+Useful commands:
+
+```powershell
+colab ls -s agent
+colab upload -s agent .\data.parquet /content/data.parquet
+colab download -s agent /content/result.parquet .\result.parquet
+colab rm -s agent /content/tmp.bin
+colab install -s agent numpy pandas pyarrow
+```
+
+This Windows fork preserves its compressed/chunked transfer paths while wrapping runtime access in refreshed-session retry logic.
+
+## Keep-alive
+
+`colab new` starts a detached keep-alive helper automatically. The agent should not launch a second keep-alive process manually.
+
+The keep-alive implementation uses the Colab Tunnel Frontend assignment ping on `colab.research.google.com` and periodically performs kernel activity so headless sessions are less likely to be idle-pruned.
+
+`colab stop -s <name>` terminates the session and its keep-alive process. On Windows, the stored launcher PID and the Python daemon PID can differ; lifecycle tests verify that stopping the session reaps the process chain.
+
+Keep-alive is not persistence. Remote state can still disappear because of Colab policy, runtime limits, account limits, backend resets, or other service-side conditions. Important work must be checkpointed to durable storage.
+
+## Parallel agents
+
+Avoid having unrelated agents mutate the same session-state file and session name.
+
+Give each agent its own session name. For stronger isolation, use a separate config path:
+
+```powershell
+colab --config "$env:TEMP\colab-opencode.json" new -s opencode
+colab --config "$env:TEMP\colab-opencode.json" exec -s opencode -f .\job.py --timeout 300
+colab --config "$env:TEMP\colab-opencode.json" stop -s opencode
+```
+
+The keep-alive child inherits the selected `--config` and authentication mode.
+
+## Cleanup safety
+
+Before and after live work:
+
+```powershell
+colab sessions
+```
+
+Stop sessions the agent explicitly created:
+
+```powershell
+colab stop -s agent
+```
+
+A server-side assignment shown as `[?]` has no matching local session record. **Do not kill or unassign an unknown `[?]` assignment automatically.** It may belong to the user, another terminal, or another agent. Ask or establish ownership first.
+
+Never leave a known test/agent allocation running after the work is complete unless the user explicitly asked to keep it.
+
+## Recommended agent policy
+
+When this skill is active, follow these defaults:
+
+- Prefer `colab exec` with a persistent named session for iterative agent work.
+- Prefer `colab run` for independent one-shot scripts.
+- Check `colab sessions` before allocation and after cleanup.
+- Reuse a healthy named runtime instead of creating duplicates.
+- Treat timeouts as a diagnostic event, not proof that the runtime is gone.
+- Let the CLI's token/session recovery try to preserve the same assignment.
+- Never use interactive `repl`, `console`, `auth`, or `drivemount` from a non-interactive agent unless input is intentionally piped and supported.
+- Never terminate an unknown `[?]` assignment.
+- Always stop allocations the agent owns when finished.
+
+## Self-check
+
+An agent can confirm this skill is the one bundled with its installed CLI by running:
+
+```powershell
+colab skill
+```
+
+For this fork, also verify `colab version` matches the expected git-derived build before relying on Windows/session-recovery behavior.
