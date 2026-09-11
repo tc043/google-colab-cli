@@ -1,5 +1,6 @@
 ---
 log:
+2026-09-11: Made repeated `colab drivemount` calls agent-safe on an already-mounted runtime. The CLI now checks the requested mountpoint before calling `google.colab.drive.mount()`, avoiding Colab's upstream behavior of requesting `dfs_ephemeral` authorization before its own already-mounted check. Fresh Colab VMs still require one human Drive consent flow; subsequent calls on that live VM return immediately without another OAuth prompt.
 2026-08-13: Fixed issue #106 for VM-side automation. `auth`, `drivemount`, and `install` start kernels through the shared runtime-proxy refresh/retry path; `install -r` also uploads its requirements file with refreshed Contents API credentials. Metadata cleanup uses endpoint-guarded field updates.
 2026-06-11: Replaced the `oauth2` provider's `run_local_server()` (localhost redirect) with a remote copy-paste flow (`_run_remote_flow` in `auth.py`). The CLI now prints an authorization URL built with `redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html` and `token_usage=remote`, then reads the pasted authorization code via `input()` and exchanges it with `flow.fetch_token(code=...)`. This is the same flow `gcloud auth application-default login` uses and works identically in local and remote/headless/container environments, removing the heuristic of whether to auto-open a browser. Confirmed server-side acceptance with a live GET-only check against the bundled cloud-SDK client (`764086051850-...`); the OOB redirect and a non-bundled client id were both verified to be rejected (`OOB flow has been blocked` / `redirect_uri_mismatch`). Unit tests in `tests/test_auth.py` assert no localhost server is started, the redirect URI + `token_usage=remote` are set, and the pasted code is exchanged.
 2026-06-01: Enabled `colab update --install` self-update on macOS in addition to Linux. Refactored platform check logic to keep the implementation DRY and updated both tests and documentation. Also, on these platforms, an additional message is shown recommending `colab update --install` to upgrade in place, positioned above the standard `pip`/`uv` installation command.
@@ -128,15 +129,19 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
 
 -   **Action**: Execute `drive.mount()` and transparently proxy Colab's
     proprietary credential propagation flow.
--   **Code**: `python from google.colab import drive
-    drive.mount('/content/drive')`
+-   **Code**: The CLI first checks whether the requested mountpoint is already
+    mounted (`os.path.ismount`, `MyDrive`, or `My Drive`). Only an unmounted
+    runtime calls `google.colab.drive.mount(...)`.
 -   **Handling**: Because `drivefs` enforces the ephemeral side-channel
     propagation (`colab_request` over websocket), the CLI intercepts these
     messages using `ColabRuntime.colab_request_hook`. When intercepted, the CLI
     automatically interacts with the Colab backend
     (`/tun/m/credentials-propagation/`), prompts the user with the Google OAuth
     consent URL if needed, and dispatches the required `colab_reply` message to
-    the `stdin` channel to unlock the kernel thread.
+    the `stdin` channel to unlock the kernel thread. The credential propagation
+    is runtime-specific: the first Drive mount on a fresh VM still needs human
+    consent. Once that VM is mounted, repeated CLI/agent calls reuse the live
+    mount and do not invoke the authorization flow again.
 -   **Timeout**: The kernel is silent (no iopub traffic) the entire time the
     user is OAuthing in their browser. To avoid the upstream 10s
     `jupyter_kernel_client` default raising `TimeoutError` mid-flow, this

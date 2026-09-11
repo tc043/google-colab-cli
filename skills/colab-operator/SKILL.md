@@ -215,6 +215,14 @@ colab install -s agent numpy pandas pyarrow
 
 This Windows fork preserves its compressed/chunked transfer paths while wrapping runtime access in refreshed-session retry logic.
 
+## Google Drive mounting
+
+`colab drivemount -s <name>` uses Colab DriveFS. The first Drive mount on each fresh Colab VM requires Google OAuth consent from a human; agents cannot safely bypass that consent screen.
+
+Once Drive has been authorized and mounted on that live VM, this fork pre-checks the mountpoint and repeated `colab drivemount` calls return immediately without another OAuth prompt. Reuse the same mounted session for agent work instead of remounting on a new VM.
+
+For fully unattended checkpointing, prefer `colab download`/`colab upload` or an explicitly configured non-interactive durable store. Do not make an autonomous agent block on a fresh-runtime Drive consent flow.
+
 ## Keep-alive
 
 `colab new` starts a detached keep-alive helper automatically. The agent should not launch a second keep-alive process manually.
@@ -292,7 +300,8 @@ When this skill is active, follow these defaults:
 - Let the CLI's token/session recovery try to preserve the same assignment.
 - Checkpoint costly or irreplaceable work to durable storage at meaningful milestones; never treat `/content` or kernel memory as the only copy.
 - Make long jobs resumable from their latest checkpoint whenever practical.
-- Never use interactive `repl`, `console`, `auth`, or `drivemount` from a non-interactive agent unless input is intentionally piped and supported.
+- Never use interactive `repl`, `console`, or `auth` from a non-interactive agent unless input is intentionally piped and supported.
+- For Drive, reuse an already-mounted live session. A fresh VM's first `drivemount` requires human OAuth consent; unattended agents should use `colab upload/download` or another configured durable store instead.
 - Never terminate an unknown `[?]` assignment.
 - Always stop allocations the agent owns when finished.
 

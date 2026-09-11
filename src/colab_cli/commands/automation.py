@@ -226,7 +226,24 @@ def drivemount(
     # 120s): with granular consent screens users routinely exceed it, after
     # which mount proceeds credential-less and fails. 480s keeps the whole
     # ceremony inside the 600s execute() cap (pexpect adds +30s).
-    code = f"from google.colab import drive\ndrive.mount('{path}', timeout_ms=480000)"
+    # Colab's drive.mount() asks for dfs_ephemeral authorization *before* it
+    # checks whether this runtime is already mounted. Preflight the mountpoint
+    # ourselves so agents can safely re-run `colab drivemount` on the same VM
+    # without forcing the user through OAuth again.
+    mountpoint = repr(path)
+    code = f"""import os
+_mountpoint = {mountpoint}
+_already_mounted = (
+    os.path.ismount(_mountpoint)
+    or os.path.isdir(os.path.join(_mountpoint, 'MyDrive'))
+    or os.path.isdir(os.path.join(_mountpoint, 'My Drive'))
+)
+if _already_mounted:
+    print(f'Drive already mounted at {{_mountpoint}}')
+else:
+    from google.colab import drive
+    drive.mount(_mountpoint, timeout_ms=480000)
+"""
     typer.echo(f"[colab] Mounting Google Drive to '{path}' on {name}...")
     run_automation(
         name,

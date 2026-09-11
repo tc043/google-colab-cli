@@ -116,7 +116,15 @@ def test_cli_drivemount(mock_state, mock_runtime_class, mock_session):
     mock_runtime.execute_code.assert_called_once()
     called_code = mock_runtime.execute_code.call_args[0][0]
 
-    assert "drive.mount('/foo/bar'" in called_code
+    assert "_mountpoint = '/foo/bar'" in called_code
+    assert "drive.mount(_mountpoint" in called_code
+    # Avoid Colab's upstream quirk where drive.mount() requests Drive auth
+    # before checking whether this exact runtime is already mounted. Agents
+    # should be able to re-run `colab drivemount` on an existing mounted VM
+    # without forcing the human through OAuth again.
+    assert "os.path.isdir" in called_code
+    assert "My Drive" in called_code
+    assert called_code.index("os.path.isdir") < called_code.index("drive.mount")
     # 480s kernel-side window: the default 120s request_auth timeout expires
     # mid-consent (granular OAuth screens are slow), after which mount
     # proceeds credential-less and fails.
