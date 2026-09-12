@@ -537,55 +537,68 @@ def keep_alive(
                 # For other errors (network), we retry and don't count as 4xx
                 pass
 
-        # Kernel-level keep-alive: the HTTP assignment ping alone does not
-        # reliably reset Colab's reaper for headless sessions (observed prunes
-        # minutes after activity while pings succeeded). Executing a trivial
-        # cell registers as genuine kernel activity.
+        # Kernel-level keep-alive is only a best-effort supplement to the
+        # authoritative TFE ping above. Never let it block or terminate the
+        # daemon: a long-running user cell owns the kernel, and queueing a
+        # synthetic cell behind it would stop the 60-second TFE heartbeat.
         if iterations % kernel_ping_every == 0:
-            try:
-                from colab_cli.runtime import ColabRuntime
-                from colab_cli.utils import is_terminal_error
-
-                rt = ColabRuntime(
-                    s.url,
-                    s.token,
-                    kernel_id=s.kernel_id,
-                    session_id=s.session_id,
-                )
-                rt.execute_code("print('colab-cli keepalive')", timeout=20)
-                if rt.kernel_id != s.kernel_id or rt.session_id != s.session_id:
-                    s.kernel_id = rt.kernel_id
-                    s.session_id = rt.session_id
-                    state.store.add(s)
+            if s.running:
                 state.history.log_event(
                     session_name,
-                    "keep_alive_kernel_ping",
-                    {"iteration": iterations},
+                    "keep_alive_kernel_ping_skipped",
+                    {"iteration": iterations, "running": s.running},
                 )
-            except Exception as ke:
-                from colab_cli.utils import is_terminal_error
-
-                terminal = False
+            else:
                 try:
-                    terminal = is_terminal_error(ke)
-                except Exception:
-                    terminal = False
-                state.history.log_event(
-                    session_name,
-                    "keep_alive_error",
-                    {
-                        "iteration": iterations,
-                        "kind": "kernel_ping",
-                        "terminal": terminal,
-                        "error_type": type(ke).__name__,
-                        "error": str(ke)[:500],
-                    },
-                )
-                if terminal:
-                    consecutive_4xx += 1
-                    if consecutive_4xx >= 2:
-                        reason = "consecutive_4xx_errors"
-                        break
+                    from colab_cli.runtime import ColabRuntime
+
+                    def kernel_ping(current_session):
+                        rt = ColabRuntime(
+                            current_session.url,
+                            current_session.token,
+                            kernel_id=current_session.kernel_id,
+                            session_id=current_session.session_id,
+                        )
+                        try:
+                            rt.execute_code("print('colab-cli keepalive')", timeout=20)
+                            if (
+                                rt.kernel_id != current_session.kernel_id
+                                or rt.session_id != current_session.session_id
+                            ):
+                                state.store.update_fields(
+                                    session_name,
+                                    current_session.endpoint,
+                                    kernel_id=rt.kernel_id,
+                                    session_id=rt.session_id,
+                                )
+                        finally:
+                            rt.stop()
+
+                    state.run_with_runtime_proxy_retry(
+                        session_name,
+                        kernel_ping,
+                        initial_session=s,
+                    )
+                    state.history.log_event(
+                        session_name,
+                        "keep_alive_kernel_ping",
+                        {"iteration": iterations},
+                    )
+                except Exception as ke:
+                    # Kernel activity is supplementary. Log the failure and
+                    # continue the TFE loop; it must never be allowed to kill
+                    # the daemon or suppress future assignment heartbeats.
+                    state.history.log_event(
+                        session_name,
+                        "keep_alive_error",
+                        {
+                            "iteration": iterations,
+                            "kind": "kernel_ping",
+                            "terminal": False,
+                            "error_type": type(ke).__name__,
+                            "error": str(ke)[:500],
+                        },
+                    )
 
         time.sleep(60)
 

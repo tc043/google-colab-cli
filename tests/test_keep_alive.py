@@ -237,6 +237,61 @@ def test_keep_alive_loop_basic(mock_common_state):
     mock_common_state.client.keep_alive_assignment.assert_called_once_with("e1")
 
 
+def test_keep_alive_skips_kernel_ping_while_session_is_running(mock_common_state):
+    """A busy user kernel must never block the daemon's TFE keep-alive loop.
+
+    The kernel ping runs every fifth iteration. Long-running `exec` calls mark
+    the session as running; in that state the daemon must keep issuing TFE
+    pings but skip the synthetic kernel cell entirely.
+    """
+    mock_common_state.store.get.return_value = SessionState(
+        name="test",
+        token="t",
+        url="u",
+        endpoint="e1",
+        running="exec(long_job.py)",
+    )
+
+    with (
+        patch("colab_cli.runtime.ColabRuntime") as mock_runtime,
+        patch("time.sleep", side_effect=[None, None, None, None, InterruptedError]),
+        patch("time.time", side_effect=[0, 1, 61, 121, 181, 241]),
+    ):
+        with pytest.raises(InterruptedError):
+            keep_alive("e1", "test")
+
+    assert mock_common_state.client.keep_alive_assignment.call_count == 5
+    mock_runtime.assert_not_called()
+
+
+def test_keep_alive_kernel_ping_failure_does_not_stop_tfe_loop(mock_common_state):
+    """Synthetic kernel activity is supplementary and must never kill keep-alive."""
+    mock_common_state.store.get.return_value = SessionState(
+        name="test", token="t", url="u", endpoint="e1"
+    )
+    mock_common_state.run_with_runtime_proxy_retry.side_effect = RuntimeError(
+        "kernel ping failed"
+    )
+
+    with (
+        patch("time.sleep", side_effect=[None, None, None, None, InterruptedError]),
+        patch("time.time", side_effect=[0, 1, 61, 121, 181, 241]),
+    ):
+        with pytest.raises(InterruptedError):
+            keep_alive("e1", "test")
+
+    assert mock_common_state.client.keep_alive_assignment.call_count == 5
+    mock_common_state.run_with_runtime_proxy_retry.assert_called_once()
+    errors = [
+        c
+        for c in mock_common_state.history.log_event.call_args_list
+        if c.args[1] == "keep_alive_error"
+    ]
+    assert errors
+    assert errors[-1].args[2]["kind"] == "kernel_ping"
+    assert errors[-1].args[2]["terminal"] is False
+
+
 def test_keep_alive_exits_on_consecutive_4xx(mock_common_state):
     # Mock response for 404 error
     mock_response = MagicMock()
