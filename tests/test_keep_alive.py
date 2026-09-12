@@ -237,6 +237,82 @@ def test_keep_alive_loop_basic(mock_common_state):
     mock_common_state.client.keep_alive_assignment.assert_called_once_with("e1")
 
 
+def test_spawn_kernel_ping_is_one_shot_child_with_propagated_flags(mocker):
+    """Kernel activity runs outside the heartbeat daemon and inherits its config."""
+    from colab_cli.auth import AuthProvider
+    from colab_cli.commands.session import spawn_kernel_ping
+
+    mock_popen = mocker.patch("colab_cli.commands.session.subprocess.Popen")
+    worker = MagicMock()
+    mock_popen.return_value = worker
+
+    result = spawn_kernel_ping(
+        "ep1",
+        "sess1",
+        auth_provider=AuthProvider.ADC,
+        config_path="C:/tmp/sessions.json",
+    )
+
+    assert result is worker
+    cmd = mock_popen.call_args.args[0]
+    assert cmd.index("--auth=adc") < cmd.index("kernel-ping")
+    assert cmd.index("--config") < cmd.index("kernel-ping")
+    assert cmd[-3:] == ["kernel-ping", "ep1", "sess1"]
+
+
+def test_kernel_ping_worker_arms_hard_watchdog(mock_common_state):
+    """Even a websocket hang must have a process-level escape hatch."""
+    from colab_cli.commands.session import KERNEL_PING_HARD_TIMEOUT_SEC, kernel_ping
+
+    session = SessionState(name="test", token="t", url="u", endpoint="e1")
+    mock_common_state.store.get.return_value = session
+    mock_common_state.run_with_runtime_proxy_retry.side_effect = (
+        lambda name, operation, initial_session=None: operation(initial_session)
+    )
+
+    with (
+        patch("colab_cli.commands.session.threading.Timer") as mock_timer,
+        patch("colab_cli.commands.session.ColabRuntime") as mock_runtime,
+    ):
+        watchdog = mock_timer.return_value
+        kernel_ping("e1", "test")
+
+    assert mock_timer.call_args.args[0] == KERNEL_PING_HARD_TIMEOUT_SEC
+    assert watchdog.daemon is True
+    watchdog.start.assert_called_once_with()
+    watchdog.cancel.assert_called_once_with()
+    mock_runtime.return_value.execute_code.assert_called_once_with(
+        "print('colab-cli keepalive')", timeout=20
+    )
+    mock_runtime.return_value.stop.assert_called_once_with()
+
+
+def test_keep_alive_never_waits_for_inflight_kernel_ping(mock_common_state):
+    """A hung kernel worker must not suppress later TFE heartbeat iterations."""
+    mock_common_state.store.get.return_value = SessionState(
+        name="test", token="t", url="u", endpoint="e1"
+    )
+    hung_worker = MagicMock()
+    hung_worker.poll.return_value = None
+
+    with (
+        patch(
+            "colab_cli.commands.session.spawn_kernel_ping", return_value=hung_worker
+        ) as mock_spawn,
+        patch(
+            "time.sleep",
+            side_effect=[None, None, None, None, None, InterruptedError],
+        ),
+        patch("time.time", side_effect=[0, 1, 61, 121, 181, 241, 301]),
+    ):
+        with pytest.raises(InterruptedError):
+            keep_alive("e1", "test")
+
+    assert mock_common_state.client.keep_alive_assignment.call_count == 6
+    mock_spawn.assert_called_once()
+    mock_common_state.run_with_runtime_proxy_retry.assert_not_called()
+
+
 def test_keep_alive_skips_kernel_ping_while_session_is_running(mock_common_state):
     """A busy user kernel must never block the daemon's TFE keep-alive loop.
 
@@ -264,16 +340,19 @@ def test_keep_alive_skips_kernel_ping_while_session_is_running(mock_common_state
     mock_runtime.assert_not_called()
 
 
-def test_keep_alive_kernel_ping_failure_does_not_stop_tfe_loop(mock_common_state):
-    """Synthetic kernel activity is supplementary and must never kill keep-alive."""
+def test_keep_alive_kernel_ping_spawn_failure_does_not_stop_tfe_loop(
+    mock_common_state,
+):
+    """Failure to launch supplementary kernel activity must not kill TFE pings."""
     mock_common_state.store.get.return_value = SessionState(
         name="test", token="t", url="u", endpoint="e1"
     )
-    mock_common_state.run_with_runtime_proxy_retry.side_effect = RuntimeError(
-        "kernel ping failed"
-    )
 
     with (
+        patch(
+            "colab_cli.commands.session.spawn_kernel_ping",
+            side_effect=RuntimeError("kernel worker spawn failed"),
+        ),
         patch("time.sleep", side_effect=[None, None, None, None, InterruptedError]),
         patch("time.time", side_effect=[0, 1, 61, 121, 181, 241]),
     ):
@@ -281,14 +360,14 @@ def test_keep_alive_kernel_ping_failure_does_not_stop_tfe_loop(mock_common_state
             keep_alive("e1", "test")
 
     assert mock_common_state.client.keep_alive_assignment.call_count == 5
-    mock_common_state.run_with_runtime_proxy_retry.assert_called_once()
+    mock_common_state.run_with_runtime_proxy_retry.assert_not_called()
     errors = [
         c
         for c in mock_common_state.history.log_event.call_args_list
         if c.args[1] == "keep_alive_error"
     ]
     assert errors
-    assert errors[-1].args[2]["kind"] == "kernel_ping"
+    assert errors[-1].args[2]["kind"] == "kernel_ping_worker_spawn"
     assert errors[-1].args[2]["terminal"] is False
 
 

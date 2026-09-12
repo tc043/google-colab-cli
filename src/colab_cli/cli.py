@@ -109,6 +109,8 @@ def callback(
         "README",
         "skill",
         "SKILL",
+        "keep-alive",
+        "kernel-ping",
     }
     if ctx.invoked_subcommand not in _AUTO_UPDATE_SUPPRESSED:
         auto_update.run_background_check()

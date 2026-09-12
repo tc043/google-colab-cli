@@ -15,6 +15,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -31,7 +32,7 @@ from colab_cli.client import (
     resolve_assign_shape,
     shape_display_label,
 )
-from colab_cli.utils import get_status_code
+from colab_cli.utils import get_status_code, no_window_kwargs
 from colab_cli.state import SessionState
 from colab_cli.runtime import ColabRuntime
 
@@ -468,6 +469,112 @@ def spawn_keep_alive(
     return p.pid
 
 
+KERNEL_PING_HARD_TIMEOUT_SEC = 30
+KERNEL_PING_PARENT_REAP_SEC = 45
+KERNEL_PING_TIMEOUT_EXIT_CODE = 124
+
+
+def spawn_kernel_ping(
+    endpoint: str, session_name: str, auth_provider=None, config_path=None
+):
+    """Starts one disposable kernel-activity worker without waiting for it.
+
+    The authoritative TFE heartbeat must not share a blocking call path with
+    Jupyter websocket setup. The worker is therefore a separate process; the
+    keep-alive daemon only polls its process handle on later heartbeat cycles.
+    """
+    cmd = [sys.executable, "-m", "colab_cli.cli"]
+    if auth_provider is not None:
+        cmd.append(f"--auth={auth_provider.value}")
+    if config_path is not None:
+        cmd.extend(["--config", config_path])
+    cmd.extend(["kernel-ping", endpoint, session_name])
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **no_window_kwargs(),
+    )
+
+
+def kernel_ping(
+    endpoint: Annotated[str, typer.Argument(help="Endpoint ID")],
+    session_name: Annotated[str, typer.Argument(help="Session name")],
+):
+    """Hidden one-shot kernel activity worker with a hard process watchdog."""
+    from colab_cli.common import state
+
+    s = state.store.get(session_name)
+    if s is None or s.endpoint != endpoint:
+        return
+    if s.running:
+        state.history.log_event(
+            session_name,
+            "keep_alive_kernel_ping_skipped",
+            {"reason": "session_running", "running": s.running},
+        )
+        return
+
+    # execute_code(timeout=...) only bounds the Jupyter request after the
+    # websocket is usable; websocket setup itself can hang. A watchdog in this
+    # disposable child process gives the whole operation a hard upper bound.
+    watchdog = threading.Timer(
+        KERNEL_PING_HARD_TIMEOUT_SEC,
+        os._exit,
+        args=(KERNEL_PING_TIMEOUT_EXIT_CODE,),
+    )
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        def operation(current_session):
+            rt = ColabRuntime(
+                current_session.url,
+                current_session.token,
+                kernel_id=current_session.kernel_id,
+                session_id=current_session.session_id,
+            )
+            try:
+                rt.execute_code("print('colab-cli keepalive')", timeout=20)
+                if (
+                    rt.kernel_id != current_session.kernel_id
+                    or rt.session_id != current_session.session_id
+                ):
+                    state.store.update_fields(
+                        session_name,
+                        current_session.endpoint,
+                        kernel_id=rt.kernel_id,
+                        session_id=rt.session_id,
+                    )
+            finally:
+                rt.stop()
+
+        state.run_with_runtime_proxy_retry(
+            session_name,
+            operation,
+            initial_session=s,
+        )
+        state.history.log_event(
+            session_name,
+            "keep_alive_kernel_ping",
+            {"worker_pid": os.getpid()},
+        )
+    except Exception as error:
+        state.history.log_event(
+            session_name,
+            "keep_alive_error",
+            {
+                "kind": "kernel_ping",
+                "terminal": False,
+                "error_type": type(error).__name__,
+                "error": str(error)[:500],
+                "worker_pid": os.getpid(),
+            },
+        )
+    finally:
+        watchdog.cancel()
+
+
 def keep_alive(
     endpoint: Annotated[str, typer.Argument(help="Endpoint ID")],
     session_name: Annotated[str, typer.Argument(help="Session name")],
@@ -491,6 +598,8 @@ def keep_alive(
     reason = "time_limit_reached"
     extra: Dict[str, Any] = {}
     kernel_ping_every = 5  # ~every 5 minutes
+    kernel_ping_process: Optional[subprocess.Popen] = None
+    kernel_ping_started_at: Optional[float] = None
     while time.time() - start_time < max_duration:
         iterations += 1
         # Check if session still exists in local state
@@ -537,66 +646,90 @@ def keep_alive(
                 # For other errors (network), we retry and don't count as 4xx
                 pass
 
-        # Kernel-level keep-alive is only a best-effort supplement to the
-        # authoritative TFE ping above. Never let it block or terminate the
-        # daemon: a long-running user cell owns the kernel, and queueing a
-        # synthetic cell behind it would stop the 60-second TFE heartbeat.
-        if iterations % kernel_ping_every == 0:
-            if s.running:
-                state.history.log_event(
-                    session_name,
-                    "keep_alive_kernel_ping_skipped",
-                    {"iteration": iterations, "running": s.running},
+        # Reap/kill the disposable kernel worker without ever waiting for it.
+        # The worker also has its own watchdog; this parent-side deadline is a
+        # second line of defense if that watchdog itself fails.
+        if kernel_ping_process is not None:
+            return_code = kernel_ping_process.poll()
+            if return_code is None:
+                age = (
+                    time.monotonic() - kernel_ping_started_at
+                    if kernel_ping_started_at is not None
+                    else 0.0
                 )
-            else:
-                try:
-                    from colab_cli.runtime import ColabRuntime
-
-                    def kernel_ping(current_session):
-                        rt = ColabRuntime(
-                            current_session.url,
-                            current_session.token,
-                            kernel_id=current_session.kernel_id,
-                            session_id=current_session.session_id,
-                        )
-                        try:
-                            rt.execute_code("print('colab-cli keepalive')", timeout=20)
-                            if (
-                                rt.kernel_id != current_session.kernel_id
-                                or rt.session_id != current_session.session_id
-                            ):
-                                state.store.update_fields(
-                                    session_name,
-                                    current_session.endpoint,
-                                    kernel_id=rt.kernel_id,
-                                    session_id=rt.session_id,
-                                )
-                        finally:
-                            rt.stop()
-
-                    state.run_with_runtime_proxy_retry(
-                        session_name,
-                        kernel_ping,
-                        initial_session=s,
-                    )
-                    state.history.log_event(
-                        session_name,
-                        "keep_alive_kernel_ping",
-                        {"iteration": iterations},
-                    )
-                except Exception as ke:
-                    # Kernel activity is supplementary. Log the failure and
-                    # continue the TFE loop; it must never be allowed to kill
-                    # the daemon or suppress future assignment heartbeats.
+                if age >= KERNEL_PING_PARENT_REAP_SEC:
+                    try:
+                        kernel_ping_process.kill()
+                    except Exception:
+                        pass
                     state.history.log_event(
                         session_name,
                         "keep_alive_error",
                         {
                             "iteration": iterations,
-                            "kind": "kernel_ping",
+                            "kind": "kernel_ping_worker",
                             "terminal": False,
-                            "error_type": type(ke).__name__,
-                            "error": str(ke)[:500],
+                            "timeout": True,
+                            "age_seconds": round(age, 2),
+                        },
+                    )
+                    kernel_ping_process = None
+                    kernel_ping_started_at = None
+            else:
+                if return_code != 0:
+                    state.history.log_event(
+                        session_name,
+                        "keep_alive_error",
+                        {
+                            "iteration": iterations,
+                            "kind": "kernel_ping_worker",
+                            "terminal": False,
+                            "timeout": return_code == KERNEL_PING_TIMEOUT_EXIT_CODE,
+                            "return_code": return_code,
+                        },
+                    )
+                kernel_ping_process = None
+                kernel_ping_started_at = None
+
+        # Kernel-level activity is only a best-effort supplement. Re-read the
+        # session immediately before scheduling so a newly-started user command
+        # wins the kernel. The actual Jupyter work happens in a disposable
+        # child process and can never block this TFE heartbeat loop.
+        if iterations % kernel_ping_every == 0:
+            current_session = state.store.get(session_name)
+            if current_session is None or current_session.endpoint != endpoint:
+                pass
+            elif current_session.running:
+                state.history.log_event(
+                    session_name,
+                    "keep_alive_kernel_ping_skipped",
+                    {"iteration": iterations, "running": current_session.running},
+                )
+            elif kernel_ping_process is not None:
+                state.history.log_event(
+                    session_name,
+                    "keep_alive_kernel_ping_skipped",
+                    {"iteration": iterations, "reason": "worker_inflight"},
+                )
+            else:
+                try:
+                    kernel_ping_process = spawn_kernel_ping(
+                        endpoint,
+                        session_name,
+                        auth_provider=state.auth_provider,
+                        config_path=state.config_path,
+                    )
+                    kernel_ping_started_at = time.monotonic()
+                except Exception as error:
+                    state.history.log_event(
+                        session_name,
+                        "keep_alive_error",
+                        {
+                            "iteration": iterations,
+                            "kind": "kernel_ping_worker_spawn",
+                            "terminal": False,
+                            "error_type": type(error).__name__,
+                            "error": str(error)[:500],
                         },
                     )
 
@@ -619,4 +752,5 @@ def register(app: typer.Typer):
     app.command(name="restart-kernel")(restart_kernel)
     app.command()(status)
     app.command()(stop)
+    app.command(name="kernel-ping", hidden=True)(kernel_ping)
     app.command(hidden=True)(keep_alive)
